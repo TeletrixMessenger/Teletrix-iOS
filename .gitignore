@@ -63,3 +63,4 @@ iOSInjectionProject/
 **/Settings.bundle/AppFlags.plist
 **/Settings.bundle/Root.plist
 .build
+.DS_Store
