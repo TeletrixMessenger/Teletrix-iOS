@@ -15,34 +15,37 @@ PODS:
   - AFNetworking/UIKit (4.0.1):
     - AFNetworking/NSURLSession
   - GZIP (1.3.0)
-  - JitsiMeetSDK (2.11.0)
+  - JitsiMeetSDK (5.0.2)
   - libbase58 (0.1.4)
-  - MatrixSDK (0.17.4):
-    - MatrixSDK/Core (= 0.17.4)
-  - MatrixSDK/Core (0.17.4):
+  - MatrixSDK (0.23.18):
+    - MatrixSDK/Core (= 0.23.18)
+  - MatrixSDK/Core (0.23.18):
     - AFNetworking (~> 4.0.0)
     - GZIP (~> 1.3.0)
     - libbase58 (~> 0.1.4)
-    - OLMKit (~> 3.1.0)
-    - Realm (= 10.1.4)
-  - MatrixSDK/JingleCallStack (0.17.4):
-    - JitsiMeetSDK (= 2.11.0)
+    - MatrixSDK/CryptoSDK
+    - OLMKit (~> 3.2.5)
+    - Realm (= 10.27.0)
+    - SwiftyBeaver (= 1.9.5)
+  - MatrixSDK/CryptoSDK (0.23.18):
+    - MatrixSDKCrypto (= 0.1.0)
+  - MatrixSDK/JingleCallStack (0.23.18):
+    - JitsiMeetSDK (= 5.0.2)
     - MatrixSDK/Core
-  - MatrixSDK/SwiftSupport (0.17.4):
-    - MatrixSDK/Core
-  - OLMKit (3.1.0):
-    - OLMKit/olmc (= 3.1.0)
-    - OLMKit/olmcpp (= 3.1.0)
-  - OLMKit/olmc (3.1.0)
-  - OLMKit/olmcpp (3.1.0)
-  - Realm (10.1.4):
-    - Realm/Headers (= 10.1.4)
-  - Realm/Headers (10.1.4)
+  - MatrixSDKCrypto (0.1.0)
+  - OLMKit (3.2.12):
+    - OLMKit/olmc (= 3.2.12)
+    - OLMKit/olmcpp (= 3.2.12)
+  - OLMKit/olmc (3.2.12)
+  - OLMKit/olmcpp (3.2.12)
+  - Realm (10.27.0):
+    - Realm/Headers (= 10.27.0)
+  - Realm/Headers (10.27.0)
+  - SwiftyBeaver (1.9.5)
 
 DEPENDENCIES:
   - MatrixSDK
   - MatrixSDK/JingleCallStack
-  - MatrixSDK/SwiftSupport
 
 SPEC REPOS:
   trunk:
@@ -51,18 +54,22 @@ SPEC REPOS:
     - JitsiMeetSDK
     - libbase58
     - MatrixSDK
+    - MatrixSDKCrypto
     - OLMKit
     - Realm
+    - SwiftyBeaver
 
 SPEC CHECKSUMS:
   AFNetworking: 7864c38297c79aaca1500c33288e429c3451fdce
   GZIP: 416858efbe66b41b206895ac6dfd5493200d95b3
-  JitsiMeetSDK: ddc915b751b0166aa4fdfee938bd60cc87aff9f3
+  JitsiMeetSDK: edcac8e2b92ee0c7f3e75bd0aefefbe9faccfc93
   libbase58: 7c040313537b8c44b6e2d15586af8e21f7354efd
-  MatrixSDK: 39282219213aebf621326f6335073b5a2b1e9113
-  OLMKit: 4ee0159d63feeb86d836fdcfefe418e163511639
-  Realm: 80f4fb2971ccb9adc27a47d0955ae8e533a7030b
+  MatrixSDK: 26da2e3a9f3b02fc6ea67f5bc311d30f06f9ffba
+  MatrixSDKCrypto: 4b9146d5ef484550341be056a164c6930038028e
+  OLMKit: da115f16582e47626616874e20f7bb92222c7a51
+  Realm: 9ca328bd7e700cc19703799785e37f77d1a130f2
+  SwiftyBeaver: 84069991dd5dca07d7069100985badaca7f0ce82
 
-PODFILE CHECKSUM: 95f680835b567140e8677871df5c30f6d750bd00
+PODFILE CHECKSUM: d1d23cadbea9b5482d78b9ce92d96ebf5920232e
 
 COCOAPODS: 1.11.3

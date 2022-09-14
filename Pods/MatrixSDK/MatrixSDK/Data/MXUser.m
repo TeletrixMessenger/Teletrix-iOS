@@ -33,6 +33,9 @@
 
     // The list of update listeners (`MXOnUserUpdate`) in this room
     NSMutableArray<MXOnUserUpdate> *updateListeners;
+
+    //Only when event.originServerTs > latestUpdateTS, we change displayname and avatarUrl.
+    uint64_t latestUpdateTS;
 }
 
 @property (nonatomic) NSString *displayname;
@@ -49,7 +52,6 @@
     {
         _userId = [userId copy];
         lastActiveLocalTS = -1;
-
         updateListeners = [NSMutableArray array];
     }
     return self;
@@ -66,14 +68,22 @@
     if ((NO == [_displayname isEqualToString:roomMember.displayname]
             || NO == [_avatarUrl isEqualToString:roomMember.avatarUrl]))
     {
-        self.displayname = [roomMember.displayname copy];
-        self.avatarUrl = [roomMember.avatarUrl copy];
-        
+        if (roomMember.displayname && roomMemberEvent.originServerTs > latestUpdateTS)
+        {
+            self.displayname = [roomMember.displayname copy];
+            latestUpdateTS = roomMemberEvent.originServerTs;
+        }
+        if (roomMember.avatarUrl && roomMemberEvent.originServerTs > latestUpdateTS)
+        {
+            self.avatarUrl = [roomMember.avatarUrl copy];
+            latestUpdateTS = roomMemberEvent.originServerTs;
+        }
         // Handle here the case where the user has no defined avatar.
         if (nil == self.avatarUrl && ![MXSDKOptions sharedInstance].disableIdenticonUseForUserAvatar)
         {
             // Force to use an identicon url
             self.avatarUrl = [mxSession.mediaManager urlOfIdenticon:self.userId];
+            latestUpdateTS = roomMemberEvent.originServerTs;
         }
 
         [self notifyListeners:roomMemberEvent];
@@ -83,18 +93,23 @@
 - (void)updateWithPresenceEvent:(MXEvent*)presenceEvent inMatrixSession:(MXSession *)mxSession
 {
     NSParameterAssert(presenceEvent.eventType == MXEventTypePresence);
-    
+
     MXPresenceEventContent *presenceContent = [MXPresenceEventContent modelFromJSON:presenceEvent.content];
 
     // Displayname and avatar are optional in presence events, update user data with them
     // only if they are provided.
     // Note: It is about to change in a short future in Matrix spec.
     // Displayname and avatar updates will come only through m.room.member events
-    if (presenceContent.displayname)
+    if (presenceContent.displayname 
+            && NO == [_displayname isEqualToString:presenceContent.displayname]  
+            && presenceEvent.originServerTs > latestUpdateTS)
     {
         self.displayname = [presenceContent.displayname copy];
+        latestUpdateTS = presenceEvent.originServerTs;
     }
-    if (presenceContent.avatarUrl)
+    if (presenceContent.avatarUrl
+            && NO == [_avatarUrl isEqualToString:presenceContent.avatarUrl]
+            && presenceEvent.originServerTs > latestUpdateTS)
     {
         // We ignore non mxc avatar url
         if ([presenceContent.avatarUrl hasPrefix:kMXContentUriScheme])
@@ -105,18 +120,19 @@
         {
             self.avatarUrl = nil;
         }
+        latestUpdateTS = presenceEvent.originServerTs;
     }
-    
     // Handle here the case where the user has no defined avatar.
     if (nil == self.avatarUrl && ![MXSDKOptions sharedInstance].disableIdenticonUseForUserAvatar)
     {
         // Force to use an identicon url
         self.avatarUrl = [mxSession.mediaManager urlOfIdenticon:self.userId];
+        latestUpdateTS = presenceEvent.originServerTs;
     }
 
     _statusMsg = [presenceContent.statusMsg copy];
     _presence = presenceContent.presenceStatus;
-    
+
     lastActiveLocalTS = [[NSDate date] timeIntervalSince1970] * 1000 - presenceContent.lastActiveAgo;
     _currentlyActive = presenceContent.currentlyActive;
 
@@ -135,19 +151,19 @@
 
             self.displayname = displayname;
             self.avatarUrl = avatarUrl;
-
+            self->latestUpdateTS = [[NSDate date] timeIntervalSince1970] * 1000;
             success();
 
             [self notifyListeners:nil];
 
         } failure:^(NSError *error) {
 
-            NSLog(@"[MXUser] updateFromHomeserverOfMatrixSession failed to get avatar");
+            MXLogDebug(@"[MXUser] updateFromHomeserverOfMatrixSession failed to get avatar");
             failure(error);
         }];
     } failure:^(NSError *error) {
 
-        NSLog(@"[MXUser] updateFromHomeserverOfMatrixSession failed to get display name");
+        MXLogDebug(@"[MXUser] updateFromHomeserverOfMatrixSession failed to get display name");
         failure(error);
     }];
 }
@@ -213,6 +229,7 @@
         lastActiveLocalTS = (uint64_t)[aDecoder decodeInt64ForKey:@"lastActiveLocalTS"];
         _currentlyActive = [aDecoder decodeBoolForKey:@"currentlyActive"];
         _statusMsg = [aDecoder decodeObjectForKey:@"statusMsg"];
+        latestUpdateTS = (uint64_t)[aDecoder decodeInt64ForKey:@"latestUpdateTS"];
     }
     return self;
 }
@@ -226,6 +243,7 @@
     [aCoder encodeInt64:(int64_t)lastActiveLocalTS forKey:@"lastActiveLocalTS"];
     [aCoder encodeBool:_currentlyActive forKey:@"currentlyActive"];
     [aCoder encodeObject:_statusMsg forKey:@"statusMsg"];
+    [aCoder encodeInt64:(int64_t)latestUpdateTS forKey:@"latestUpdateTS"];
 }
 
 
@@ -241,7 +259,7 @@
     user->lastActiveLocalTS = lastActiveLocalTS;
     user->_currentlyActive = _currentlyActive;
     user->_statusMsg = [_statusMsg copyWithZone:zone];
-
+    user->latestUpdateTS = latestUpdateTS;
     return user;
 }
 

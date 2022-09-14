@@ -1,3 +1,14 @@
+.. image:: https://img.shields.io/cocoapods/v/MatrixSDK?style=flat-square 
+   :target: https://github.com/matrix-org/matrix-ios-sdk/releases
+.. image:: https://img.shields.io/cocoapods/p/MatrixSDK?style=flat-square
+   :target: README.rst
+.. image:: https://img.shields.io/github/workflow/status/matrix-org/matrix-ios-sdk/Lint%20CI/develop?style=flat-square 
+   :target: https://github.com/matrix-org/matrix-ios-sdk/actions?query=branch%3Adevelop
+.. image:: https://codecov.io/gh/matrix-org/matrix-ios-sdk/branch/develop/graph/badge.svg?token=2c9mzJoVpu 
+   :target: https://codecov.io/gh/matrix-org/matrix-ios-sdk
+.. image:: https://img.shields.io/badge/License-Apache%202.0-yellowgreen.svg?style=flat-square 
+   :target: https://opensource.org/licenses/Apache-2.0
+
 Matrix iOS SDK
 ==============
 
@@ -21,22 +32,16 @@ In order to set this up::
 The best way to add the last release of the Matrix SDK to your application
 project is to add the MatrixSDK dependency to your Podfile::
 
-    # Obj-C
     pod 'MatrixSDK'
 
 If you want to use the develop version of the SDK, use instead:
 
-    # Obj-C
     pod 'MatrixSDK', :git => 'https://github.com/matrix-org/matrix-ios-sdk.git',
     :branch => 'develop'
 
 Options
 =======
-If you want also Swift support, add the following pod to you app Podfile::
-
-    pod 'MatrixSDK/SwiftSupport'
-
-If you want to enable VoIP using the http://webrtc.org VoIP stack, add the following pod to you app Podfile::
+If you want to enable VoIP using the http://webrtc.org VoIP stack, add the following pod to your app Podfile::
 
     pod 'MatrixSDK/JingleCallStack'
 
@@ -77,7 +82,7 @@ They contain logic to maintain consistent chat room data.
 :``MXUser``:
      This is a user known by the current user, outside of the context of a
      room. MXSession exposes and maintains the list of MXUsers. It provides
-     the user id, displayname and the current presence state
+     the user id, displayname and the current presence state.
 
 Usage
 =====
@@ -108,7 +113,7 @@ instantiated with initWithHomeServer does the job:
     [mxRestClient publicRooms:^(NSArray *rooms) {
 
         // rooms is an array of MXPublicRoom objects containing information like room id
-        NSLog(@"The public rooms are: %@", rooms);
+        MXLogDebug(@"The public rooms are: %@", rooms);
 
     } failure:^(MXError *error) {
     }];
@@ -467,7 +472,9 @@ Then, open ``MatrixSDK.xcworkspace``.
 
 Tests
 =====
-The tests in the SDK Xcode project are both unit and integration tests.
+The tests in the SDK Xcode project are both unit and integration tests. 
+
+Unit tests classes use the suffix "UnitTests" to differentiate them. A unit test is a test that does not make any HTTP requests or uses mocked HTTP requests.
 
 Out of the box, the tests use one of the homeservers (located at
 http://localhost:8080) of the "Demo Federation of Homeservers"
@@ -491,13 +498,29 @@ Every time you want to launch these test homeservers, type::
 You can now run tests from the Xcode Test navigator tab or select the
 MatrixSDKTests scheme and click on the "Test" action.
 
+Test Plans
+----------
+We have test plans for the macOS target to run tests separately or with different configurations.
+
+AllTests
+  Default test plan to run all tests.
+
+AllTestsWithSanitizers
+  Run all tests with 2 configurations: "ASan + UBSan" and "TSan + UBSan". "UBSan" for Unexpected Behavior Sanitizer. "ASan" for Address Sanitizier. "Tsan" for Thread Sanitizer. This setup was advised at WWDC2019 (https://developer.apple.com/videos/play/wwdc2019/413?time=2270). This test plan requires 2 builds and 2 test runs.
+
+UnitTests
+  Test plan for all unit tests.
+
+UnitTestsWithSanitizers
+  All unit tests with the 2 configurations described above: "ASan + UBSan" and "TSan + UBSan".
+
 Known issues
 ============
 
 CocoaPods may fail to install on OSX 10.8.x with "i18n requires Ruby version
 >= 1.9.3.".  This is a known problem similar to
 https://github.com/CocoaPods/CocoaPods/issues/2458 that needs to be raised with
-the cocoapods team.
+the CocoaPods team.
 
 Registration
 ------------

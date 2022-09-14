@@ -28,12 +28,29 @@
 #import "MXFilterJSONModel.h"
 
 #import "MXEventsEnumerator.h"
+#import "MXRoomSummaryStore.h"
+
+@class MXSpaceGraphData;
+@class MXStoreService;
+@class MXCapabilities;
+@class MXMatrixVersions;
 
 /**
  The `MXStore` protocol defines an interface that must be implemented in order to store
  Matrix data handled during a `MXSession`.
  */
 @protocol MXStore <NSObject>
+
+@property (nonatomic, readonly) id<MXRoomSummaryStore> _Nonnull roomSummaryStore;
+
+#pragma mark - Store Management
+
+/**
+ The store service that is managing this store.
+ */
+@property (nonatomic, weak, nullable) MXStoreService *storeService;
+
+@property (nonatomic, readonly, nonnull) NSArray<NSString*> *roomIds;
 
 #pragma mark - Room data
 
@@ -212,12 +229,33 @@
 #pragma mark -
 /**
  Store the text message partially typed by the user but not yet sent.
- 
+
+ @deprecated use storePartialAttributedTextMessageForRoom
+
  @param roomId the id of the room.
  @param partialTextMessage the text to store. Nil to reset it.
  */
+- (void)storePartialTextMessageForRoom:(nonnull NSString*)roomId
+                    partialTextMessage:(nonnull NSString*)partialTextMessage __deprecated_msg("use storePartialAttributedTextMessageForRoom");
+
+/**
+ The text message typed by the user but not yet sent.
+
+ @deprecated use partialAttributedTextMessageOfRoom
+
+ @param roomId the id of the room.
+ @return the text message. Can be nil.
+ */
+- (NSString* _Nullable)partialTextMessageOfRoom:(nonnull NSString*)roomId __deprecated_msg("use partialAttributedTextMessageOfRoom");
+
+/**
+ Store the text message partially typed by the user but not yet sent.
+
+ @param roomId the id of the room.
+ @param partialAttributedTextMessage the text to store. Nil to reset it.
+ */
 // @TODO(summary): Move to MXRoomSummary
-- (void)storePartialTextMessageForRoom:(nonnull NSString*)roomId partialTextMessage:(nonnull NSString*)partialTextMessage;
+- (void)storePartialAttributedTextMessageForRoom:(nonnull NSString*)roomId partialAttributedTextMessage:(nonnull NSAttributedString*)partialAttributedTextMessage;
 
 /**
  The text message typed by the user but not yet sent.
@@ -225,8 +263,7 @@
  @param roomId the id of the room.
  @return the text message. Can be nil.
  */
-- (NSString* _Nullable)partialTextMessageOfRoom:(nonnull NSString*)roomId;
-
+- (NSAttributedString* _Nullable)partialAttributedTextMessageOfRoom:(nonnull NSString*)roomId;
 
 /**
  Returns the receipts list for an event in a dedicated room.
@@ -235,9 +272,12 @@
  @param roomId The room Id.
  @param eventId The event Id.
  @param sort to sort them from the latest to the oldest
- @return the receipts for an event in a dedicated room.
+ @param completion Completion block containing the receipts for an event in a dedicated room.
  */
-- (NSArray<MXReceiptData*> * _Nullable)getEventReceipts:(nonnull NSString*)roomId eventId:(nonnull NSString*)eventId sorted:(BOOL)sort;
+- (void)getEventReceipts:(nonnull NSString*)roomId
+                 eventId:(nonnull NSString*)eventId
+                  sorted:(BOOL)sort
+              completion:(nonnull void (^)(NSArray<MXReceiptData*> * _Nonnull))completion;
 
 /**
  Store the receipt for a user in a room
@@ -258,16 +298,40 @@
 - (MXReceiptData * _Nullable)getReceiptInRoom:(nonnull NSString*)roomId forUserId:(nonnull NSString*)userId;
 
 /**
+ Load receipts for a room asynchronously.
+ 
+ @param roomId the id of the room.
+ @param completion Completion block to be called at the end of the process. Will be called in main thread.
+ */
+- (void)loadReceiptsForRoom:(nonnull NSString *)roomId completion:(nullable void (^)(void))completion;
+
+/**
  Count the unread events wrote in the store.
  
  @discussion: The returned count is relative to the local storage. The actual unread messages
  for a room may be higher than the returned value.
  
  @param roomId the room id.
+ @param threadId the thread id to count unread events in. Pass nil not to filter by any thread.
  @param types an array of event types strings (MXEventTypeString).
  @return The number of unread events which have their type listed in the provided array.
  */
-- (NSUInteger)localUnreadEventCount:(nonnull NSString*)roomId withTypeIn:(nullable NSArray*)types;
+- (NSUInteger)localUnreadEventCount:(nonnull NSString*)roomId threadId:(nullable NSString*)threadId withTypeIn:(nullable NSArray*)types;
+
+/**
+ Incoming events since the last user receipt data.
+
+ @discussion: The returned count is relative to the local storage. The actual unread messages
+ for a room may be higher than the returned value.
+
+ @param roomId the room id.
+ @param threadId the thread id to consider events in. Pass nil not to filter by any thread.
+ @param types an array of event types strings to consider
+ @return Filtered events that came after the user receipt.
+ */
+- (nonnull NSArray<MXEvent*>*)newIncomingEventsInRoom:(nonnull NSString*)roomId
+                                             threadId:(nullable NSString*)threadId
+                                           withTypeIn:(nullable NSArray<MXEventTypeString>*)types;
 
 /**
  Indicate if the MXStore implementation stores data permanently.
@@ -296,107 +360,39 @@
  */
 - (void)storeHomeserverWellknown:(nonnull MXWellKnown*)homeserverWellknown;
 
-
-@optional
-
 /**
- Save changes in the store.
-
- If the store uses permanent storage like database or file, it is the optimised time
- to commit the last changes.
+ The homeserver capabilities.
  */
-- (void)commit;
+@property (nonatomic, readonly) MXCapabilities * _Nullable homeserverCapabilities;
 
 /**
- Close the store.
+ Store the homeserver capabilities.
+
+ @param homeserverCapabilities the homeserver capabilities to store.
+ */
+- (void)storeHomeserverCapabilities:(nonnull MXCapabilities*)homeserverCapabilities;
+
+/**
+ Supported Matrix versions by the homeserver.
+ */
+@property (nonatomic, readonly) MXMatrixVersions * _Nullable supportedMatrixVersions;
+
+/**
+ Store the supported Matrix versions.
+
+ @param supportedMatrixVersions the supported Matrix versions to store.
+ */
+- (void)storeSupportedMatrixVersions:(nonnull MXMatrixVersions*)supportedMatrixVersions;
+
+#pragma mark - Room Messages
+
+/**
+ Load room messages for a room.
  
- Any pending operation must be complete in this call.
+ @param roomId The id of the desired room.
+ @param completion Completion block to be called at the end of the process. Will be called on main thread.
  */
-- (void)close;
-
-
-#pragma mark - Permanent storage -
-
-/**
- Return the ids of the rooms currently stored.
-
- Note: this method is required in permanent storage implementation.
-
- @return the array of room ids.
- */
-- (NSArray* _Nullable)rooms;
-
-#pragma mark - Room state
-
-/**
- Store the state of a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @param stateEvents the state events that define the room state.
- */
-- (void)storeStateForRoom:(nonnull NSString*)roomId stateEvents:(nonnull NSArray<MXEvent*> *)stateEvents;
-
-/**
- Get the state of a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @param success A block object called when the operation succeeds.
- @param failure A block object called when the operation fails.
- */
-- (void)stateOfRoom:(nonnull NSString *)roomId
-            success:(nonnull void (^)(NSArray<MXEvent *> * _Nonnull stateEvents))success
-            failure:(nullable void (^)(NSError * _Nonnull error))failure;
-
-
-#pragma mark - Room summary
-
-/**
- Store the summary for a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @param summary the room summary.
- */
-- (void)storeSummaryForRoom:(nonnull NSString*)roomId summary:(nonnull MXRoomSummary*)summary;
-
-/**
- Get the summary a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @return the user private data for this room.
- */
-- (MXRoomSummary* _Nullable)summaryOfRoom:(nonnull NSString*)roomId;
-
-
-#pragma mark - Room user data
-
-/**
- Store the user data for a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @param accountData the private data the user defined for this room.
- */
-- (void)storeAccountDataForRoom:(nonnull NSString*)roomId userData:(nonnull MXRoomAccountData*)accountData;
-
-/**
- Get the user data for a room.
-
- Note: this method is required in permanent storage implementation.
-
- @param roomId the id of the room.
- @return the user private data for this room.
-*/
-- (MXRoomAccountData* _Nullable)accountDataOfRoom:(nonnull NSString*)roomId;
-
+- (void)loadRoomMessagesForRoom:(nonnull NSString *)roomId completion:(nullable void (^)(void))completion;
 
 #pragma mark - Outgoing events
 /**
@@ -430,6 +426,97 @@
  */
 - (NSArray<MXEvent*>* _Nullable)outgoingMessagesInRoom:(nonnull NSString*)roomId;
 
+@optional
+
+/**
+ Save changes in the store.
+ 
+ Implementations may call `commitWithCompletion:` with a nil block.
+ */
+- (void)commit;
+
+/**
+ Save changes in the store.
+
+ If the store uses permanent storage like database or file, it is the optimised time
+ to commit the last changes.
+ 
+ @param completion Completion block to be called when operation completed. Will be called on main thread.
+ */
+- (void)commitWithCompletion:(void (^_Nullable)(void))completion;
+
+/**
+ Close the store.
+ 
+ Any pending operation must be complete in this call.
+ */
+- (void)close;
+
+
+#pragma mark - Media repository
+
+/**
+ The maximum size an upload can be in bytes.
+ */
+@property (nonatomic, readonly) NSInteger maxUploadSize;
+
+/**
+ Store the maximum upload size.
+
+ @param maxUploadSize The maximum upload size to store.
+ */
+- (void)storeMaxUploadSize:(NSInteger)maxUploadSize;
+
+
+#pragma mark - Permanent storage -
+
+#pragma mark - Room state
+
+/**
+ Store the state of a room.
+
+ Note: this method is required in permanent storage implementation.
+
+ @param roomId the id of the room.
+ @param stateEvents the state events that define the room state.
+ */
+- (void)storeStateForRoom:(nonnull NSString*)roomId stateEvents:(nonnull NSArray<MXEvent*> *)stateEvents;
+
+/**
+ Get the state of a room.
+
+ Note: this method is required in permanent storage implementation.
+
+ @param roomId the id of the room.
+ @param success A block object called when the operation succeeds.
+ @param failure A block object called when the operation fails.
+ */
+- (void)stateOfRoom:(nonnull NSString *)roomId
+            success:(nonnull void (^)(NSArray<MXEvent *> * _Nonnull stateEvents))success
+            failure:(nullable void (^)(NSError * _Nonnull error))failure;
+
+#pragma mark - Room user data
+
+/**
+ Store the user data for a room.
+
+ Note: this method is required in permanent storage implementation.
+
+ @param roomId the id of the room.
+ @param accountData the private data the user defined for this room.
+ */
+- (void)storeAccountDataForRoom:(nonnull NSString*)roomId userData:(nonnull MXRoomAccountData*)accountData;
+
+/**
+ Get the user data for a room.
+
+ Note: this method is required in permanent storage implementation.
+
+ @param roomId the id of the room.
+ @return the user private data for this room.
+*/
+- (MXRoomAccountData* _Nullable)accountDataOfRoom:(nonnull NSString*)roomId;
+
 
 #pragma mark - User Account data
 /**
@@ -437,6 +524,10 @@
  */
 @property (nonatomic) NSDictionary * _Nullable userAccountData;
 
+/**
+ Store/retrieve the state of agreement to the identity server's terms of service.
+ */
+@property (nonatomic) BOOL areAllIdentityServerTermsAgreed;
 
 #pragma mark - Matrix filters
 /**
@@ -451,6 +542,11 @@
  @param filterId the id of this filter on the homeserver.
  */
 - (void)storeFilter:(nonnull MXFilterJSONModel*)filter withFilterId:(nonnull NSString*)filterId;
+
+/**
+ Retrieve a list of all stored filter ids.
+ */
+- (nonnull NSArray <NSString *> *)allFilterIds;
 
 /**
  Retrieve a filter with a given id.
@@ -473,5 +569,6 @@
 - (void)filterIdForFilter:(nonnull MXFilterJSONModel*)filter
                   success:(nonnull void (^)(NSString * _Nullable filterId))success
                   failure:(nullable void (^)(NSError * _Nullable error))failure;
+
 
 @end

@@ -19,6 +19,7 @@
 #import "MXSDKOptions.h"
 
 #import "MXBaseProfiler.h"
+#import "MatrixSDKSwiftHeader.h"
 
 static MXSDKOptions *sharedOnceInstance = nil;
 
@@ -43,11 +44,37 @@ static MXSDKOptions *sharedOnceInstance = nil;
         _enableCryptoWhenStartingMXSession = NO;
         _enableKeyBackupWhenStartingMXCrypto = YES;
         _mediaCacheAppVersion = 0;
+        _videoConversionPresetName = AVAssetExportPreset1920x1080;
         _applicationGroupIdentifier = nil;
         _HTTPAdditionalHeaders = @{};
+        _autoAcceptRoomInvites = NO;
+        _callTransferType = MXCallTransferTypeBridged;
+        self.roomListDataManagerClass = [MXCoreDataRoomListDataManager class];
+        _clientPermalinkBaseUrl = nil;
+        _authEnableRefreshTokens = NO;
+        _enableThreads = NO;
+        _enableRoomSharedHistoryOnInvite = NO;
+        
+        #if DEBUG
+        _enableCryptoV2 = NO;
+        #endif
+        
+        // The value is set randomly between YES / NO to perform a very basic A/B test
+        // measured by `analytics` (if set and enabled)
+        _enableGroupSessionCache = arc4random_uniform(2) == 1;
+
+        _enableSymmetricBackup = NO;
     }
     
     return self;
+}
+
+- (void)setRoomListDataManagerClass:(Class)roomListDataManagerClass
+{
+    // Sanity check
+    NSAssert([roomListDataManagerClass conformsToProtocol:@protocol(MXRoomListDataManager)], @"MXSDKOptions only manages room list data manager class that conforms to MXRoomListDataManager protocol");
+    
+    _roomListDataManagerClass = roomListDataManagerClass;
 }
 
 @end

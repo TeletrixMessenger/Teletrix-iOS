@@ -37,6 +37,8 @@
 #import <MatrixKit/MatrixKit.h>
 #endif
 
+#warning File has not been annotated with nullability, see MX_ASSUME_MISSING_NULLABILITY_BEGIN
+
 @interface MXBugReportRestClient ()
 {
     // The bug report API server URL.
@@ -59,7 +61,7 @@
 
 @implementation MXBugReportRestClient
 
-- (instancetype)initWithBugReportEndpoint:(NSString *)theBugReportEndpoint
+- (nonnull instancetype)initWithBugReportEndpoint:(NSString *)theBugReportEndpoint
 {
     self = [super init];
     if (self)
@@ -98,11 +100,11 @@
     return self;
 }
 
-- (void)sendBugReport:(NSString *)text sendLogs:(BOOL)sendLogs sendCrashLog:(BOOL)sendCrashLog sendFiles:(NSArray<NSURL*>*)files attachGitHubLabels:(NSArray<NSString*>*)gitHubLabels progress:(void (^)(MXBugReportState, NSProgress *))progress success:(void (^)(void))success failure:(void (^)(NSError *))failure
+- (void)sendBugReport:(NSString *)text sendLogs:(BOOL)sendLogs sendCrashLog:(BOOL)sendCrashLog sendFiles:(NSArray<NSURL*>*)files attachGitHubLabels:(NSArray<NSString*>*)gitHubLabels progress:(void (^)(MXBugReportState, NSProgress *))progress success:(void (^)(NSString*))success failure:(void (^)(NSError *))failure
 {
     if (_state != MXBugReportStateReady)
     {
-        NSLog(@"[MXBugReport] sendBugReport failed. There is already a submission in progress. state: %@", @(_state));
+        MXLogDebug(@"[MXBugReport] sendBugReport failed. There is already a submission in progress. state: %@", @(_state));
 
         if (failure)
         {
@@ -124,7 +126,7 @@
     }
 }
 
--(void)sendBugReport:(NSString *)text sendFiles:(NSArray<NSURL*>*)files attachGitHubLabels:(NSArray<NSString*>*)gitHubLabels progress:(void (^)(MXBugReportState, NSProgress *))progress success:(void (^)(void))success failure:(void (^)(NSError *))failure
+-(void)sendBugReport:(NSString *)text sendFiles:(NSArray<NSURL*>*)files attachGitHubLabels:(NSArray<NSString*>*)gitHubLabels progress:(void (^)(MXBugReportState, NSProgress *))progress success:(void (^)(NSString*))success failure:(void (^)(NSError *))failure
 {
     // The bugreport api needs at least app and version to render well
     NSParameterAssert(_appName && _version);
@@ -227,7 +229,7 @@
 
     if (error)
     {
-        NSLog(@"[MXBugReport] sendBugReport: multipartFormRequestWithMethod failed. Error: %@", error);
+        MXLogDebug(@"[MXBugReport] sendBugReport: multipartFormRequestWithMethod failed. Error: %@", error);
 
         _state = MXBugReportStateReady;
 
@@ -244,7 +246,7 @@
                                           progress:^(NSProgress * _Nonnull uploadProgress) {
                                               MXStrongifyAndReturnIfNil(self);
 
-                                              NSLog(@"[MXBugReport] sendBugReport: uploadProgress: %@", @(uploadProgress.fractionCompleted));
+                                              MXLogDebug(@"[MXBugReport] sendBugReport: uploadProgress: %@", @(uploadProgress.fractionCompleted));
 
                                               if (progress)
                                               {
@@ -266,7 +268,7 @@
 
                                               if (error)
                                               {
-                                                  NSLog(@"[MXBugReport] sendBugReport: report failed. Error: %@", error);
+                                                  MXLogDebug(@"[MXBugReport] sendBugReport: report failed. Error: %@", error);
 
                                                   if (failure)
                                                   {
@@ -275,11 +277,16 @@
                                               }
                                               else
                                               {
-                                                  NSLog(@"[MXBugReport] sendBugReport: report done in %.3fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
-
+                                                  MXLogDebug(@"[MXBugReport] sendBugReport: report done in %.3fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                                                  
+                                                  NSString *reportUrl = nil;
+                                                  if ([response isKindOfClass:[NSDictionary class]]) {
+                                                      NSDictionary *responseDictionary = (NSDictionary*)responseObject;
+                                                      reportUrl = responseDictionary[@"report_url"];
+                                                  }
                                                   if (success)
                                                   {
-                                                      success();
+                                                      success(reportUrl);
                                                   }
                                               }
                                           }];
@@ -316,9 +323,12 @@
     if (logFiles.count)
     {
         _state = MXBugReportStateProgressZipping;
-
+        
         NSProgress *zipProgress = [NSProgress progressWithTotalUnitCount:logFiles.count];
-        progress(_state, zipProgress);
+        if (progress)
+        {
+            progress(_state, zipProgress);
+        }
 
         MXWeakify(self);
         dispatch_async(dispatchQueue, ^{
@@ -352,7 +362,7 @@
                 }
                 else
                 {
-                    NSLog(@"[MXBugReport] zipLogFiles: Failed to zip %@", logFile);
+                    MXLogDebug(@"[MXBugReport] zipLogFiles: Failed to zip %@", logFile);
                 }
 
                 if (progress)
@@ -365,7 +375,7 @@
                 }
             }
 
-            NSLog(@"[MXBugReport] zipLogFiles: Zipped %tu logs (%@ to %@) in %.3fms", logFiles.count,
+            MXLogDebug(@"[MXBugReport] zipLogFiles: Zipped %tu logs (%@ to %@) in %.3fms", logFiles.count,
                   [NSByteCountFormatter stringFromByteCount:size countStyle:NSByteCountFormatterCountStyleFile],
                   [NSByteCountFormatter stringFromByteCount:zipSize countStyle:NSByteCountFormatterCountStyleFile],
                   [[NSDate date] timeIntervalSinceDate:startDate] * 1000);

@@ -99,6 +99,20 @@
 - (void)generateOneTimeKeys:(NSUInteger)numKeys;
 
 /**
+ The current fallback key for this account.
+
+ @return a dictionary with one key which is "curve25519".
+         Its value is a dictionary where keys are keys ids
+         and values, the Curve25519 keys.
+ */
+@property (nonatomic, readonly) NSDictionary *fallbackKey;
+
+/**
+ Generate a new fallback key
+ */
+- (void)generateFallbackKey;
+
+/**
  Generate a new outbound session.
  
  The new session will be stored in the MXStore.
@@ -178,35 +192,32 @@ Determine if an incoming messages is a prekey message matching an existing sessi
 /**
  Generate a new outbound group session.
 
- @return the session id for the outbound session.
+ @param roomId Identifer of the room.
+ @return the newly created and stored outbound group session.
  */
-- (NSString*)createOutboundGroupSession;
+- (MXOlmOutboundGroupSession *)createOutboundGroupSessionForRoomWithRoomId:(NSString *)roomId;
 
 /**
- Get the current session key of  an outbound group session.
+ Store a outbound group session with session ID and room with ID.
 
- @param sessionId the id of the outbound group session.
- @return the base64-encoded secret key.
+ @param session outbound group session to be stored.
  */
-- (NSString*)sessionKeyForOutboundGroupSession:(NSString*)sessionId;
+- (void)storeOutboundGroupSession:(MXOlmOutboundGroupSession *)session;
 
 /**
- Get the current message index of an outbound group session.
+ Retrieve a outbound group session Info for a specific room.
 
- @param sessionId the id of the outbound group session.
- @return the current chain index.
+ @param roomId Identifer of the room.
+ @return the session info instance for the outbound session. Nil if not found in store.
  */
-- (NSUInteger)messageIndexForOutboundGroupSession:(NSString*)sessionId;
+- (MXOlmOutboundGroupSession *)outboundGroupSessionForRoomWithRoomId:(NSString *)roomId;
 
 /**
- Encrypt an outgoing message with an outbound group session.
-
- @param sessionId the id of the outbound group session.
- @param payloadString the payload to be encrypted and sent.
- @return ciphertext
+ Remove the outbound group session for a specific room.
+ 
+ @param roomId Identifer of the room.
  */
-- (NSString*)encryptGroupMessage:(NSString*)sessionId payloadString:(NSString*)payloadString;
-
+- (void)discardOutboundGroupSessionForRoomWithRoomId:(NSString *)roomId;
 
 #pragma mark - Inbound group session
 /**
@@ -219,20 +230,23 @@ Determine if an incoming messages is a prekey message matching an existing sessi
  @param forwardingCurve25519KeyChain devices which forwarded this session to us (normally empty)
  @param keysClaimed Other keys the sender claims.
  @param exportFormat YES if the megolm keys are in export format (ie, they lack an ed25519 signature).
+ @param sharedHistory YES if the session was created whilst room's history was set to visible (i.e. `world_readable` or `shared`
  
  @return YES if the operation succeeds.
  */
-- (BOOL)addInboundGroupSession:(NSString*)sessionId sessionKey:(NSString*)sessionKey
+- (BOOL)addInboundGroupSession:(NSString*)sessionId
+                    sessionKey:(NSString*)sessionKey
                         roomId:(NSString*)roomId
                      senderKey:(NSString*)senderKey
   forwardingCurve25519KeyChain:(NSArray<NSString *> *)forwardingCurve25519KeyChain
                    keysClaimed:(NSDictionary<NSString*, NSString*>*)keysClaimed
-                  exportFormat:(BOOL)exportFormat;
+                  exportFormat:(BOOL)exportFormat
+                 sharedHistory:(BOOL)sharedHistory;
 
 /**
  Add previously-exported inbound group sessions to the session store.
 
- @param data the group sessions data.
+ @param inboundGroupSessionsData the group sessions data.
  @return the imported keys.
  */
 - (NSArray<MXOlmInboundGroupSession *>*)importInboundGroupSessions:(NSArray<MXMegolmSessionData *>*)inboundGroupSessionsData;
@@ -241,6 +255,9 @@ Determine if an incoming messages is a prekey message matching an existing sessi
  Decrypt a received message with an inbound group session.
  
  @param body the base64-encoded body of the encrypted message.
+ @param isEditEvent whether the event has an edit relationship to another event.
+                    This is used when detecting a replay attack as a way to
+                    distinguish an edit of a message from the original edited message.
  @param roomId the room in which the message was received.
  @param timeline the id of the timeline where the event is decrypted. It is used
                  to prevent replay attack.
@@ -250,7 +267,9 @@ Determine if an incoming messages is a prekey message matching an existing sessi
 
  @return the decrypting result. Nil if the sessionId is unknown.
  */
-- (MXDecryptionResult*)decryptGroupMessage:(NSString*)body roomId:(NSString*)roomId
+- (MXDecryptionResult*)decryptGroupMessage:(NSString*)body
+                               isEditEvent:(BOOL)isEditEvent
+                                    roomId:(NSString*)roomId
                                 inTimeline:(NSString*)timeline
                                  sessionId:(NSString*)sessionId senderKey:(NSString*)senderKey
                                      error:(NSError** )error;

@@ -16,6 +16,9 @@
 
 #import "MXFileStoreMetaData.h"
 
+static NSString* const kEncodingKeyCapabilities = @"capabilities";
+static NSString* const kEncodingKeySupportedMatrixVersions = @"supportedMatrixVersions";
+
 @implementation MXFileStoreMetaData
 
 - (id)initWithCoder:(NSCoder *)aDecoder
@@ -29,11 +32,19 @@
         _eventStreamToken = dict[@"eventStreamToken"];
         _syncFilterId = dict[@"syncFilterId"];
         _userAccountData = dict[@"userAccountData"];
+        
+        NSNumber *areAllTermsAgreed = dict[@"areAllIdentityServerTermsAgreed"];
+        _areAllIdentityServerTermsAgreed = [areAllTermsAgreed boolValue];
 
         NSNumber *version = dict[@"version"];
         _version = [version unsignedIntegerValue];
 
         _homeserverWellknown = dict[@"wellknown"];
+        _homeserverCapabilities = dict[kEncodingKeyCapabilities];
+        _supportedMatrixVersions = dict[kEncodingKeySupportedMatrixVersions];
+        
+        NSNumber *maxUploadSize = dict[@"maxUploadSize"];
+        _maxUploadSize = [maxUploadSize integerValue] ?: -1;
     }
     return self;
 }
@@ -46,6 +57,8 @@
                                   @"homeServer": _homeServer,
                                   @"userId": _userId,
                                   @"version": @(_version),
+                                  @"maxUploadSize": @(_maxUploadSize),
+                                  @"areAllIdentityServerTermsAgreed": [NSNumber numberWithBool:_areAllIdentityServerTermsAgreed]
                                   }];
 
     // Nullable properties
@@ -65,6 +78,14 @@
     {
         dict[@"wellknown"] = _homeserverWellknown;
     }
+    if (_homeserverCapabilities)
+    {
+        dict[kEncodingKeyCapabilities] = _homeserverCapabilities;
+    }
+    if (_supportedMatrixVersions)
+    {
+        dict[kEncodingKeySupportedMatrixVersions] = _supportedMatrixVersions;
+    }
 
     [aCoder encodeObject:dict forKey:@"dict"];
 }
@@ -78,6 +99,10 @@
     metaData->_version = _version;
     metaData->_eventStreamToken = [_eventStreamToken copyWithZone:zone];
     metaData->_userAccountData = [_userAccountData copyWithZone:zone];
+    metaData->_areAllIdentityServerTermsAgreed = _areAllIdentityServerTermsAgreed;
+    metaData->_maxUploadSize = _maxUploadSize;
+    metaData->_homeserverCapabilities = _homeserverCapabilities;
+    metaData->_supportedMatrixVersions = _supportedMatrixVersions;
  
     return metaData;
 }

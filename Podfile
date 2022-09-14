@@ -6,7 +6,6 @@ target 'Teletrix' do
 
   # Pods for Teletrix
   pod 'MatrixSDK'
-  pod 'MatrixSDK/SwiftSupport'
   pod 'MatrixSDK/JingleCallStack'
 
 end

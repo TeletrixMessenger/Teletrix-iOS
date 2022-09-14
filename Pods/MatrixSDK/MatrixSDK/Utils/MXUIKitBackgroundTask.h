@@ -16,20 +16,22 @@
 
 #import <Foundation/Foundation.h>
 #import "MXBackgroundTask.h"
-
-#if TARGET_OS_IPHONE
+#import "MXApplicationProtocol.h"
 
 NS_ASSUME_NONNULL_BEGIN
+
+typedef id<MXApplicationProtocol> _Nullable (^MXApplicationGetterBlock)(void);
 
 /**
  MXUIKitBackgroundTask is a concrete implementation of MXBackgroundTask using UIApplication background task.
  */
 @interface MXUIKitBackgroundTask : NSObject<MXBackgroundTask>
 
-- (instancetype)initAndStartWithName:(NSString*)name expirationHandler:(nullable MXBackgroundTaskExpirationHandler)expirationHandler;
+- (nullable instancetype)initAndStartWithName:(NSString*)name
+                                     reusable:(BOOL)reusable
+                            expirationHandler:(nullable MXBackgroundTaskExpirationHandler)expirationHandler
+                             applicationBlock:(MXApplicationGetterBlock)applicationBlock;
 
 @end
 
 NS_ASSUME_NONNULL_END
-
-#endif

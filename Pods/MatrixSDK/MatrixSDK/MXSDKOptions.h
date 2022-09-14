@@ -17,9 +17,22 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 
 #import "MXAnalyticsDelegate.h"
 #import "MXProfiler.h"
+
+/**
+ Call transfer types. `MXCallTransferTypeLocal` is created for future, not used right now.
+ */
+typedef NS_ENUM(NSUInteger, MXCallTransferType)
+{
+    //  Bridged call transfer type
+    MXCallTransferTypeBridged,
+
+    //  Local call transfer type
+    MXCallTransferTypeLocal
+};
 
 
 #pragma mark - Build time options
@@ -73,6 +86,12 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic) BOOL computeE2ERoomSummaryTrust;
 
 /**
+ Handle `m.call.asserted_identity` events for the calls.
+ NO by default.
+ */
+@property (nonatomic) BOOL handleCallAssertedIdentityEvents;
+
+/**
  The delegate object to receive analytics events
  
  By default, nil.
@@ -93,6 +112,13 @@ NS_ASSUME_NONNULL_BEGIN
  The default version value is 0.
  */
 @property (nonatomic) NSUInteger mediaCacheAppVersion;
+
+/**
+ The preset name given to AVAssetExportSession when converting a video.
+ 
+ The default value is AVAssetExportPreset1920x1080.
+ */
+@property (nonatomic) NSString *videoConversionPresetName;
 
 /**
  Object that handle enabling background mode
@@ -121,6 +147,89 @@ NS_ASSUME_NONNULL_BEGIN
  @remark Empty dictionary by default.
 */
 @property (nonatomic, nullable) NSDictionary<NSString *, NSString*> *HTTPAdditionalHeaders;
+
+/**
+ Flag to automatically accept room invites.
+ 
+ @remark NO by default.
+ */
+@property (nonatomic, assign) BOOL autoAcceptRoomInvites;
+
+/**
+ Custom domain to use to fetch the matrix client wellknown.
+ 
+ It is nil by default. By default, MXSession uses the domain of the user id.
+ */
+@property (nonatomic, nullable) NSString *wellknownDomainUrl;
+
+/**
+ Call transfer type to be used when transferring calls.
+ 
+ @remark `MXCallTransferTypeBridged` by default.
+ */
+@property (nonatomic, assign) MXCallTransferType callTransferType;
+
+/**
+ The class of room list data manager. This class must conform to MXRoomListDataManager protocol.
+ By default this class is MXCoreDataRoomListDataManager.
+ */
+@property (nonatomic) Class roomListDataManagerClass;
+
+/**
+ For use in clients that use a custom base url for permalinks rather than matrix.to.
+ This baseURL is used to generate permalinks within the app (E.g. timeline message permalinks).
+ An Optional String, when nil matrix.to format/hostname is used instead.
+ */
+@property (nonatomic, nullable) NSString *clientPermalinkBaseUrl;
+
+/**
+ Use refresh tokens and expiring access tokens as the auth mechanism as opposed to long-lived access tokens.
+ 
+ @remark NO by default.
+ */
+@property (nonatomic, assign) BOOL authEnableRefreshTokens;
+
+/**
+ Enable threading module and thread-specific replies to events.
+
+ @remark NO by default.
+ */
+@property (nonatomic) BOOL enableThreads;
+
+/**
+ Enable sharing of session keys for an immediate historical context (e.g. last 10-20 messages)
+ when inviting a new user to a room with shared history.
+ 
+ @remark NO by default.
+ */
+@property (nonatomic) BOOL enableRoomSharedHistoryOnInvite;
+
+#if DEBUG
+
+/**
+ Enable Crypto module V2, a work-in-progress and NOT production-ready implementation
+ of [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk/tree/main/crates/matrix-sdk-crypto).
+ 
+ @remark NO by default.
+ */
+@property (nonatomic) BOOL enableCryptoV2;
+
+#endif
+
+/**
+ Enable performance optimization where inbound group sessions are cached between decryption of events
+ rather than fetched from the store every time.
+ 
+ @remark By default, the value is set randomly between YES / NO to perform a very basic A/B test
+ */
+@property (nonatomic) BOOL enableGroupSessionCache;
+
+/**
+ Enable symmetric room key backups
+ 
+ @remark NO by default
+ */
+@property (nonatomic) BOOL enableSymmetricBackup;
 
 @end
 

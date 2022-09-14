@@ -15,6 +15,7 @@
  */
 
 #import "MXIdentityService.h"
+#import "MXServiceTerms.h"
 
 #import "MXRestClient.h"
 #import "MXTools.h"
@@ -22,6 +23,7 @@
 #pragma mark - Defines & Constants
 
 NSString *const MXIdentityServiceTermsNotSignedNotification = @"MXIdentityServiceTermsNotSignedNotification";
+NSString *const MXIdentityServiceTermsAcceptedNotification = @"MXIdentityServiceTermsAcceptedNotification";
 
 NSString *const MXIdentityServiceDidChangeAccessTokenNotification = @"MXIdentityServiceDidChangeAccessTokenNotification";
 
@@ -89,7 +91,7 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
     self = [super init];
     if (self)
     {
-        identityServerRestClient.shouldRenewTokenHandler = ^BOOL(NSError *error) {
+        identityServerRestClient.tokenValidationResponseHandler = ^BOOL(NSError *error) {
             
             BOOL shouldRenewAccesToken = NO;
             
@@ -98,6 +100,7 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
                 MXError *mxError = [[MXError alloc] initWithNSError:error];
                 if ([mxError.errcode isEqualToString:kMXErrCodeStringUnauthorized])
                 {
+                    self.accessToken = nil;
                     shouldRenewAccesToken = YES;
                 }
             }
@@ -106,14 +109,9 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
         };
         
         MXWeakify(self);
-        
-        identityServerRestClient.renewTokenHandler = ^MXHTTPOperation* (void (^success)(NSString *), void (^failure)(NSError *)) {
-            MXStrongifyAndReturnValueIfNil(self, nil);
-            
-            return [self renewAccessTokenWithSuccess:^(NSString *accessToken) {
-                self.accessToken = accessToken;
-                success(accessToken);
-            } failure:failure];
+        identityServerRestClient.tokenProviderHandler = ^(NSError *error, void (^success)(NSString *accessToken), void (^failure)(NSError *error)) {
+            MXStrongifyAndReturnIfNil(self);
+            [self accessTokenWithSuccess:success failure:failure];
         };
         
         self.restClient = identityServerRestClient;
@@ -121,6 +119,7 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
         self.homeserverRestClient = homeserverRestClient;
         
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleHTTPClientError:) name:kMXHTTPClientMatrixErrorNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleServiceTermsAccepted:) name:MXIdentityServiceTermsAcceptedNotification object:nil];
     }
     return self;
 }
@@ -136,11 +135,25 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
         success(self.accessToken);
         return nil;
     }
-    
-    return [self.restClient getAccessTokenAndRenewIfNeededWithSuccess:^(NSString * _Nonnull accessToken) {
-        // If we get here, we have an access token
-        success(self.accessToken);
+    return [self renewAccessTokenWithSuccess:^(NSString *accessToken) {
+        self.accessToken = accessToken;
+        success(accessToken);
     } failure:failure];
+}
+
+#pragma mark Terms of Service
+
+- (void)handleServiceTermsAccepted:(NSNotification*)notification
+{
+    NSString *identityServer = notification.userInfo[MXIdentityServiceNotificationIdentityServerKey];
+    
+    // Ensure the terms are for this identity service
+    if (identityServer == self.identityServer)
+    {
+        // And update if they are. This will be double checked when the account
+        // data gets updated, but for now this allows UI updates to take place.
+        self->_areAllTermsAgreed = YES;
+    }
 }
 
 #pragma mark Association lookup
@@ -458,6 +471,8 @@ NSString *const MXIdentityServiceNotificationAccessTokenKey = @"accessToken";
         && [httpClient.baseURL.absoluteString hasPrefix:self.identityServer]
         && [mxError.errcode isEqualToString:kMXErrCodeStringTermsNotSigned] && accessToken)
     {
+        self->_areAllTermsAgreed = NO;
+        
         NSDictionary *userInfo = [self notificationUserInfoWithAccessToken:accessToken];
         [[NSNotificationCenter defaultCenter] postNotificationName:MXIdentityServiceTermsNotSignedNotification object:nil userInfo:userInfo];
     }

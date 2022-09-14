@@ -21,6 +21,8 @@
 
 #import "MXRealmAggregationsMapper.h"
 
+#import "MXLog.h"
+#import "RLMRealm+MatrixSDK.h"
 
 @interface MXRealmAggregationsStore ()
 
@@ -51,11 +53,11 @@
 - (void)addOrUpdateReactionCount:(nonnull MXReactionCount *)reactionCount onEvent:(nonnull NSString *)eventId inRoom:(nonnull NSString *)roomId
 {
     RLMRealm *realm = self.realm;
-
-    [realm transactionWithBlock:^{
+    
+    [realm transactionWithName:@"[MXRealmAggregationsStore] addOrUpdateReactionCount" block:^{
         MXRealmReactionCount *realmReactionCount = [self.mapper realmReactionCountFromReactionCount:reactionCount
                                                                                             onEvent:eventId
-                                                                                            inRoomd:roomId];
+                                                                                           inRoomId:roomId];
         [realm addOrUpdateObject:realmReactionCount];
     }];
 }
@@ -69,8 +71,8 @@
 
 - (nullable MXReactionCount *)reactionCountForReaction:(nonnull NSString *)reaction onEvent:(nonnull NSString *)eventId
 {
-    MXRealmReactionCount *realmReactionCount = [MXRealmReactionCount objectsInRealm:self.realm
-                                                                              where:@"primaryKey = %@", [MXRealmReactionCount primaryKeyFromEventId:eventId andReaction:reaction]].firstObject;
+    NSString *primaryKey = [MXRealmReactionCount primaryKeyFromEventId:eventId andReaction:reaction];
+    MXRealmReactionCount *realmReactionCount = [MXRealmReactionCount objectInRealm:self.realm forPrimaryKey:primaryKey];
 
     MXReactionCount *reactionCount;
     if (realmReactionCount)
@@ -85,10 +87,11 @@
 {
     RLMRealm *realm = self.realm;
 
-    [realm transactionWithBlock:^{
-        RLMResults<MXRealmReactionCount *> *realmReactionCounts = [MXRealmReactionCount objectsInRealm:self.realm
-                                                                                                 where:@"primaryKey = %@", [MXRealmReactionCount primaryKeyFromEventId:eventId andReaction:reaction]];
-        [realm deleteObjects:realmReactionCounts];
+    [realm transactionWithName:@"[MXRealmAggregationsStore] deleteReactionCountsForReaction" block:^{
+        NSString *primaryKey = [MXRealmReactionCount primaryKeyFromEventId:eventId andReaction:reaction];
+        
+        MXRealmReactionCount *realmReactionCount = [MXRealmReactionCount objectInRealm:realm forPrimaryKey:primaryKey];
+        [realm deleteObject:realmReactionCount];
     }];
 }
 
@@ -98,10 +101,10 @@
 - (void)setReactionCounts:(nonnull NSArray<MXReactionCount *> *)reactionCounts onEvent:(nonnull NSString *)eventId inRoom:(nonnull NSString *)roomId
 {
     RLMRealm *realm = self.realm;
-
-    [realm transactionWithBlock:^{
+    
+    [realm transactionWithName:@"[MXRealmAggregationsStore] setReactionCounts" block:^{
         // Flush previous data
-        RLMResults<MXRealmReactionCount *> *realmReactionCounts = [MXRealmReactionCount objectsInRealm:self.realm
+        RLMResults<MXRealmReactionCount *> *realmReactionCounts = [MXRealmReactionCount objectsInRealm:realm
                                                                                                  where:@"eventId = %@", eventId];
         [realm deleteObjects:realmReactionCounts];
 
@@ -110,7 +113,7 @@
         {
             MXRealmReactionCount *realmReactionCount = [self.mapper realmReactionCountFromReactionCount:reactionCount
                                                                                                 onEvent:eventId
-                                                                                                inRoomd:roomId];
+                                                                                               inRoomId:roomId];
             [realm addOrUpdateObject:realmReactionCount];
         }
     }];
@@ -131,16 +134,16 @@
             [reactionCounts addObject:reactionCount];
         }
     }
-
+    
     return reactionCounts;
 }
 
 - (void)deleteAllReactionCountsInRoom:(nonnull NSString *)roomId
 {
     RLMRealm *realm = self.realm;
-
-    [realm transactionWithBlock:^{
-        RLMResults<MXRealmReactionCount *> *results = [MXRealmReactionCount objectsInRealm:self.realm
+    
+    [realm transactionWithName:@"[MXRealmAggregationsStore] deleteAllReactionCountsInRoom" block:^{
+        RLMResults<MXRealmReactionCount *> *results = [MXRealmReactionCount objectsInRealm:realm
                                                                                      where:@"roomId = %@", roomId];
         [realm deleteObjects:results];
     }];
@@ -153,9 +156,9 @@
 - (void)addReactionRelation:(MXReactionRelation*)relation inRoom:(NSString*)roomId
 {
     RLMRealm *realm = self.realm;
-
-    [realm transactionWithBlock:^{
-        MXRealmReactionRelation *realmRelation = [self.mapper realmReactionRelationFromReactionRelation:relation inRoomd:roomId];
+    
+    [realm transactionWithName:@"[MXRealmAggregationsStore] addReactionRelation" block:^{
+        MXRealmReactionRelation *realmRelation = [self.mapper realmReactionRelationFromReactionRelation:relation inRoomId:roomId];
         [realm addOrUpdateObject:realmRelation];
     }];
 }
@@ -178,12 +181,11 @@
 {
     RLMRealm *realm = self.realm;
 
-    [realm transactionWithBlock:^{
+    [realm transactionWithName:@"[MXRealmAggregationsStore] deleteReactionRelation" block:^{
         NSString *primaryKey = [MXRealmReactionRelation primaryKeyFromEventId:relation.eventId andReactionEventId:relation.reactionEventId];
 
-        RLMResults<MXRealmReactionRelation *> *results = [MXRealmReactionRelation objectsInRealm:self.realm
-                                                                                     where:@"primaryKey = %@", primaryKey];
-        [realm deleteObjects:results];
+        MXRealmReactionRelation *result = [MXRealmReactionRelation objectInRealm:realm forPrimaryKey:primaryKey];
+        [realm deleteObject:result];
     }];
 }
 
@@ -212,8 +214,8 @@
 {
     RLMRealm *realm = self.realm;
 
-    [realm transactionWithBlock:^{
-        RLMResults<MXRealmReactionRelation *> *results = [MXRealmReactionRelation objectsInRealm:self.realm
+    [realm transactionWithName:@"[MXRealmAggregationsStore] deleteAllReactionRelationsInRoom" block:^{
+        RLMResults<MXRealmReactionRelation *> *results = [MXRealmReactionRelation objectsInRealm:realm
                                                                                            where:@"roomId = %@", roomId];
         [realm deleteObjects:results];
     }];
@@ -226,7 +228,7 @@
 {
     RLMRealm *realm = self.realm;
 
-    [realm transactionWithBlock:^{
+    [realm transactionWithName:@"[MXRealmAggregationsStore] deleteAll" block:^{
         [realm deleteAllObjects];
     }];
 }
@@ -241,7 +243,7 @@
 
     if (error)
     {
-        NSLog(@"[MXRealmFileProvider] realmForUser gets error: %@", error);
+        MXLogDebug(@"[MXRealmFileProvider] realmForUser gets error: %@", error);
     }
 
     return realm;
@@ -264,7 +266,7 @@
 
     if (folderCreationError)
     {
-        NSLog(@"[MXScanRealmFileProvider] Fail to create Realm folder %@ with error: %@", realmFileFolderURL, folderCreationError);
+        MXLogDebug(@"[MXScanRealmFileProvider] Fail to create Realm folder %@ with error: %@", realmFileFolderURL, folderCreationError);
     }
 
     realmConfiguration.fileURL = realmFileURL;

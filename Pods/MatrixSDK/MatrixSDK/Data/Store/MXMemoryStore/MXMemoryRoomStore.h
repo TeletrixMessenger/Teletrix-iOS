@@ -30,9 +30,6 @@
     // This significanly improves [MXMemoryStore eventWithEventId:] and [MXMemoryStore eventExistsWithEventId:]
     // speed. The last one is critical since it is called on each received event to check event duplication.
     NSMutableDictionary<NSString*, MXEvent*> *messagesByEventIds;
-
-    // The events that are being sent.
-    NSMutableArray<MXEvent*> *outgoingMessages;
 }
 
 /**
@@ -96,13 +93,14 @@
 - (id<MXEventsEnumerator>)enumeratorForMessagesWithTypeIn:(NSArray*)types;
 
 /**
-  Get all events newer than the event with the passed id.
+ Get all events newer than the event with the passed id.
 
-  @param eventId the event id to find.
-  @param types a set of event types strings (MXEventTypeString).
-  @return the messages events after an event Id
+ @param eventId the event id to find.
+ @param threadId the thread id to find events in. Pass nil not to use any filtering.
+ @param types a set of event types strings (MXEventTypeString).
+ @return the messages events after an event Id
  */
-- (NSArray*)eventsAfter:(NSString *)eventId except:(NSString*)userId withTypeIn:(NSSet*)types;
+- (NSArray<MXEvent*>*)eventsAfter:(NSString *)eventId threadId:(NSString*)threadId except:(NSString*)userId withTypeIn:(NSSet<MXEventTypeString>*)types;
 
 /**
  Get events related to a specific event.
@@ -115,31 +113,14 @@
 
 /**
  The text message partially typed by the user but not yet sent in the room.
+
+ @deprecated use partialAttributedTextMessage
  */
-@property (nonatomic) NSString *partialTextMessage;
+@property (nonatomic) NSString *partialTextMessage __deprecated_msg("use partialAttributedTextMessage");
 
 /**
- Store into the store an outgoing message event being sent in the room.
-
- @param outgoingMessage the MXEvent object of the message.
+ The text message partially typed by the user but not yet sent in the room.
  */
-- (void)storeOutgoingMessage:(MXEvent*)outgoingMessage;
-
-/**
- Remove all outgoing messages from the room.
- */
-- (void)removeAllOutgoingMessages;
-
-/**
- Remove an outgoing message from the room.
-
- @param outgoingMessageEventId the id of the message to remove.
- */
-- (void)removeOutgoingMessage:(NSString*)outgoingMessageEventId;
-
-/**
- All outgoing messages pending in the room.
- */
-@property (nonatomic) NSArray<MXEvent*> *outgoingMessages;
+@property (nonatomic) NSAttributedString *partialAttributedTextMessage;
 
 @end

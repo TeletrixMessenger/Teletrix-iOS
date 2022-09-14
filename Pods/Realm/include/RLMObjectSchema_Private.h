@@ -41,10 +41,12 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readwrite, assign) Class accessorClass;
 @property (nonatomic, readwrite, assign) Class unmanagedClass;
 
+@property (nonatomic, readwrite, assign) bool hasCustomEventSerialization;
+
 @property (nonatomic, readwrite, nullable) RLMProperty *primaryKeyProperty;
 
 @property (nonatomic, copy) NSArray<RLMProperty *> *computedProperties;
-@property (nonatomic, readonly) NSArray<RLMProperty *> *swiftGenericProperties;
+@property (nonatomic, readonly, nullable) NSArray<RLMProperty *> *swiftGenericProperties;
 
 // returns a cached or new schema for a given object class
 + (instancetype)schemaForObjectClass:(Class)objectClass;

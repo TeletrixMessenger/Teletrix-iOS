@@ -26,7 +26,15 @@
 #import "MXTools.h"
 #import "MXBase64Tools.h"
 #import "MXError.h"
-
+#import "MXKeyProvider.h"
+#import "MXRawDataKey.h"
+#import "MXCrossSigning_Private.h"
+#import "MXSharedHistoryKeyService.h"
+#import "MXCurve25519BackupAuthData.h"
+#import "MXAes256BackupAuthData.h"
+#import "MXKeyBackupAlgorithm.h"
+#import "MXCurve25519KeyBackupAlgorithm.h"
+#import "MXAes256KeyBackupAlgorithm.h"
 
 #pragma mark - Constants definitions
 
@@ -42,6 +50,8 @@ NSUInteger const kMXKeyBackupWaitingTimeToSendKeyBackup = 10000;
  */
 NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
+static NSDictionary<NSString*, Class<MXKeyBackupAlgorithm>> *AlgorithmClassesByName;
+static Class DefaultAlgorithmClass;
 
 @interface MXKeyBackup ()
 {
@@ -62,6 +72,24 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 @implementation MXKeyBackup
 
 #pragma mark - SDK-Private methods -
+
++ (void)initialize
+{
+    if (MXSDKOptions.sharedInstance.enableSymmetricBackup)
+    {
+        AlgorithmClassesByName = @{
+            kMXCryptoCurve25519KeyBackupAlgorithm: MXCurve25519KeyBackupAlgorithm.class,
+            kMXCryptoAes256KeyBackupAlgorithm: MXAes256KeyBackupAlgorithm.class
+        };
+    }
+    else
+    {
+        AlgorithmClassesByName = @{
+            kMXCryptoCurve25519KeyBackupAlgorithm: MXCurve25519KeyBackupAlgorithm.class,
+        };
+    }
+    DefaultAlgorithmClass = MXCurve25519KeyBackupAlgorithm.class;
+}
 
 - (instancetype)initWithCrypto:(MXCrypto *)theCrypto
 {
@@ -97,15 +125,15 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     } failure:^(NSError * _Nonnull error) {
         MXStrongifyAndReturnIfNil(self);
 
-        NSLog(@"[MXKeyBackup] checkAndStartKeyBackup: Failed to get current version: %@", error);
+        MXLogDebug(@"[MXKeyBackup] checkAndStartKeyBackup: Failed to get current version: %@", error);
         self.state = MXKeyBackupStateUnknown;
     }];
 }
 
 - (void)checkAndStartWithKeyBackupVersion:(nullable MXKeyBackupVersion*)keyBackupVersion
 {
-    NSLog(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: %@", keyBackupVersion.version);
- 
+    MXLogDebug(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: %@", keyBackupVersion.version);
+
     self->_keyBackupVersion = keyBackupVersion;
     if (!self.keyBackupVersion)
     {
@@ -118,38 +146,52 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
     if (trustInfo.usable)
     {
-        NSLog(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: Found usable key backup. version: %@", keyBackupVersion.version);
+        MXLogDebug(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: Found usable key backup. version: %@", keyBackupVersion.version);
 
         // Check the version we used at the previous app run
         NSString *versionInStore = crypto.store.backupVersion;
         if (versionInStore && ![versionInStore isEqualToString:keyBackupVersion.version])
         {
-            NSLog(@"[MXKeyBackup] -> clean the previously used version(%@)", versionInStore);
+            MXLogDebug(@"[MXKeyBackup] -> clean the previously used version(%@)", versionInStore);
             [self resetKeyBackupData];
         }
         
         // Check private keys
         if (self.hasPrivateKeyInCryptoStore)
         {
-            NSString *pKDecryptionPublicKey = [self pkDecrytionPublicKeyFromCryptoStore];
-            
-            if (![self checkPkDecryptionPublicKey:pKDecryptionPublicKey forKeyBackupVersion:keyBackupVersion])
+            Class<MXKeyBackupAlgorithm> algorithmClass = AlgorithmClassesByName[keyBackupVersion.algorithm];
+            if (algorithmClass == NULL)
             {
-                NSLog(@"[MXKeyBackup] -> clean local private key (%@)", pKDecryptionPublicKey);
+                NSString *message = [NSString stringWithFormat:@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: unknown algorithm: %@", keyBackupVersion.algorithm];
+                MXLogError(message);
+                return;
+            }
+            if (![algorithmClass checkBackupVersion:keyBackupVersion])
+            {
+                MXLogError(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: invalid backup data returned");
+                return;
+            }
+
+            NSData *privateKey = self.privateKeyFromCryptoStore;
+            NSError *error;
+            BOOL keyMatches = [algorithmClass keyMatches:privateKey withAuthData:keyBackupVersion.authData error:&error];
+            if (error || !keyMatches)
+            {
+                MXLogDebug(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: -> private key does not match: %@, will be removed", error);
                 [crypto.store deleteSecretWithSecretId:MXSecretId.keyBackup];
             }
         }
         
-        NSLog(@"[MXKeyBackup]    -> enabling key backups");
+        MXLogDebug(@"[MXKeyBackup]    -> enabling key backups");
         [self enableKeyBackup:keyBackupVersion];
     }
     else
     {
-        NSLog(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: No usable key backup. version: %@", keyBackupVersion.version);
+        MXLogDebug(@"[MXKeyBackup] checkAndStartWithKeyBackupVersion: No usable key backup. version: %@", keyBackupVersion.version);
 
         if (crypto.store.backupVersion)
         {
-            NSLog(@"[MXKeyBackup]    -> disable the current version");
+            MXLogDebug(@"[MXKeyBackup]    -> disable the current version");
             [self resetKeyBackupData];
         }
 
@@ -166,13 +208,17 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 - (NSError*)enableKeyBackup:(MXKeyBackupVersion*)version
 {
     NSError *error;
-    MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:version error:&error];
+    id<MXBaseKeyBackupAuthData> authData = [self megolmBackupAuthDataFromKeyBackupVersion:version error:&error];
     if (!error)
     {
         _keyBackupVersion = version;
-        self->crypto.store.backupVersion = version.version;
-        _backupKey = [OLMPkEncryption new];
-        [_backupKey setRecipientKey:authData.publicKey];
+        crypto.store.backupVersion = version.version;
+        Class algorithmClass = AlgorithmClassesByName[version.algorithm];
+        //  store the desired backup algorithm
+        _keyBackupAlgorithm = [[algorithmClass alloc] initWithCrypto:crypto authData:authData keyGetterBlock:^NSData * _Nullable{
+            return self.privateKeyFromCryptoStore;
+        }];
+        MXLogDebug(@"[MXKeyBackup] Algorithm set to: %@", _keyBackupAlgorithm);
 
         self.state = MXKeyBackupStateReadyToBackUp;
         
@@ -184,13 +230,13 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
 - (void)resetKeyBackupData
 {
-    NSLog(@"[MXKeyBackup] resetKeyBackupData");
+    MXLogDebug(@"[MXKeyBackup] resetKeyBackupData");
     
     [self resetBackupAllGroupSessionsObjects];
     
     self->crypto.store.backupVersion = nil;
     [self->crypto.store deleteSecretWithSecretId:MXSecretId.keyBackup];
-   _backupKey = nil;
+    _keyBackupAlgorithm = nil;
 
     // Reset backup markers
     [self->crypto.store resetBackupMarkers];
@@ -201,6 +247,8 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     if (_state == MXKeyBackupStateReadyToBackUp)
     {
         self.state = MXKeyBackupStateWillBackUp;
+
+        MXLogDebug(@"[MXKeyBackup] maybeSendKeyBackup: ready to send keybackup");
 
         // Wait between 0 and 10 seconds, to avoid backup requests from
         // different clients hitting the server all at the same time when a
@@ -216,7 +264,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     }
     else
     {
-        NSLog(@"[MXKeyBackup] maybeSendKeyBackup: Skip it because state: %@", @(_state));
+        MXLogDebug(@"[MXKeyBackup] maybeSendKeyBackup: Skip it because state: %@", @(_state));
 
         // If not already done, check for a valid backup version on the homeserver.
         // If one, maybeSendKeyBackup will be called again.
@@ -226,12 +274,12 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
 - (void)sendKeyBackup
 {
-    NSLog(@"[MXKeyBackup] sendKeyBackup");
+    MXLogDebug(@"[MXKeyBackup] sendKeyBackup");
 
     // Get a chunk of keys to backup
     NSArray<MXOlmInboundGroupSession*> *sessions = [crypto.store inboundGroupSessionsToBackup:kMXKeyBackupSendKeysMaxCount];
 
-    NSLog(@"[MXKeyBackup] sendKeyBackup: 1 - %@ sessions to back up", @(sessions.count));
+    MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 1 - %@ sessions to back up", @(sessions.count));
 
     if (!sessions.count)
     {
@@ -247,9 +295,9 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     }
 
     // Sanity check
-    if (!self.enabled || !_backupKey || !_keyBackupVersion)
+    if (!self.enabled || !_keyBackupAlgorithm || !_keyBackupVersion)
     {
-        NSLog(@"[MXKeyBackup] sendKeyBackup: Invalid state: %@", @(_state));
+        MXLogDebug(@"[MXKeyBackup] sendKeyBackup: Invalid state: %@", @(_state));
         if (backupAllGroupSessionsFailure)
         {
             NSError *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
@@ -264,7 +312,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
     self.state = MXKeyBackupStateBackingUp;
 
-    NSLog(@"[MXKeyBackup] sendKeyBackup: 2 - Encrypting keys");
+    MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 2 - Encrypting keys");
 
     // Gather data to send to the homeserver
     // roomId -> sessionId -> MXKeyBackupData
@@ -273,16 +321,19 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
     for (MXOlmInboundGroupSession *session in sessions)
     {
-        MXKeyBackupData *keyBackupData = [self encryptGroupSession:session];
+        MXKeyBackupData *keyBackupData = [_keyBackupAlgorithm encryptGroupSession:session];
 
-        if (!roomsKeyBackup[session.roomId])
+        if (keyBackupData)
         {
-            roomsKeyBackup[session.roomId] = [NSMutableDictionary dictionary];
+            if (!roomsKeyBackup[session.roomId])
+            {
+                roomsKeyBackup[session.roomId] = [NSMutableDictionary dictionary];
+            }
+            roomsKeyBackup[session.roomId][session.session.sessionIdentifier] = keyBackupData;
         }
-        roomsKeyBackup[session.roomId][session.session.sessionIdentifier] = keyBackupData;
     }
 
-    NSLog(@"[MXKeyBackup] sendKeyBackup: 3 - Finalising data to send");
+    MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 3 - Finalising data to send");
 
     // Finalise data to send
     NSMutableDictionary<NSString*, MXRoomKeysBackupData*> *rooms = [NSMutableDictionary dictionary];
@@ -302,26 +353,26 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     MXKeysBackupData *keysBackupData = [MXKeysBackupData new];
     keysBackupData.rooms = rooms;
 
-    NSLog(@"[MXKeyBackup] sendKeyBackup: 4 - Sending request");
+    MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 4 - Sending request");
 
     // Make the request
     MXWeakify(self);
     [crypto.matrixRestClient sendKeysBackup:keysBackupData version:_keyBackupVersion.version success:^{
         MXStrongifyAndReturnIfNil(self);
 
-        NSLog(@"[MXKeyBackup] sendKeyBackup: 5a - Request complete");
+        MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 5a - Request complete");
 
         // Mark keys as backed up
         [self->crypto.store markBackupDoneForInboundGroupSessions:sessions];
 
         if (sessions.count < kMXKeyBackupSendKeysMaxCount)
         {
-            NSLog(@"[MXKeyBackup] sendKeyBackup: All keys have been backed up");
+            MXLogDebug(@"[MXKeyBackup] sendKeyBackup: All keys have been backed up");
             self.state = MXKeyBackupStateReadyToBackUp;
         }
         else
         {
-            NSLog(@"[MXKeyBackup] sendKeyBackup: Continue to back up keys");
+            MXLogDebug(@"[MXKeyBackup] sendKeyBackup: Continue to back up keys");
             self.state = MXKeyBackupStateWillBackUp;
 
             [self sendKeyBackup];
@@ -330,7 +381,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     } failure:^(NSError *error) {
         MXStrongifyAndReturnIfNil(self);
 
-        NSLog(@"[MXKeyBackup] sendKeyBackup: 5b - sendKeysBackup failed. Error: %@", error);
+        MXLogDebug(@"[MXKeyBackup] sendKeyBackup: 5b - sendKeysBackup failed. Error: %@", error);
 
         void (^backupAllGroupSessionsFailure)(NSError *error) = self->backupAllGroupSessionsFailure;
 
@@ -356,7 +407,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
 - (void)requestPrivateKeys:(void (^)(void))onComplete
 {
-    NSLog(@"[MXKeyBackup] requestPrivateKeys");
+    MXLogDebug(@"[MXKeyBackup] requestPrivateKeys");
           
     [self requestPrivateKeysToDeviceIds:nil success:^{
     } onPrivateKeysReceived:^{
@@ -364,7 +415,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
         [self restoreKeyBackupAutomaticallyWithPrivateKey:onComplete];
         
     } failure:^(NSError * _Nonnull error) {
-        NSLog(@"[MXKeyBackup] requestPrivateKeys. Error for requestPrivateKeys: %@", error);
+        MXLogDebug(@"[MXKeyBackup] requestPrivateKeys. Error for requestPrivateKeys: %@", error);
         onComplete();
     }];
 }
@@ -372,7 +423,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 - (void)restoreKeyBackupAutomaticallyWithPrivateKey:(void (^)(void))onComplete
 {
     // Check we have alreaded loaded the backup before going further
-    NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically: Current backup version %@", self.keyBackupVersion);
+    MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically: Current backup version %@", self.keyBackupVersion);
     if (!self.keyBackupVersion)
     {
         // Backup not yet retrieved?
@@ -383,7 +434,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
                 [self restoreKeyBackupAutomaticallyWithPrivateKey:onComplete];
             }
         } failure:^(NSError * _Nonnull error) {
-            NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically: Cannot fetch backup version. Error: %@", error);
+            MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically: Cannot fetch backup version. Error: %@", error);
         }];
         return;
     }
@@ -391,16 +442,18 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     // Check private keys
     if (!self.hasPrivateKeyInCryptoStore)
     {
-        NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error: No private key");
+        MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error: No private key");
         onComplete();
         return;
     }
     
     // Check private keys validity
-    NSString *pKDecryptionPublicKey = [self pkDecrytionPublicKeyFromCryptoStore];
-    if (![self checkPkDecryptionPublicKey:pKDecryptionPublicKey forKeyBackupVersion:self.keyBackupVersion])
+    NSData *privateKey = self.privateKeyFromCryptoStore;
+    NSError *error;
+    BOOL keyMatches = [_keyBackupAlgorithm keyMatches:privateKey error:&error];
+    if (error || !keyMatches)
     {
-        NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error: Invalid private key (%@)", pKDecryptionPublicKey);
+        MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error: Private key does not match: %@", error);
         [crypto.store deleteSecretWithSecretId:MXSecretId.keyBackup];
         onComplete();
         return;
@@ -409,11 +462,11 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     // Do the restore operation in background
     [self restoreUsingPrivateKeyKeyBackup:self.keyBackupVersion room:nil session:nil success:^(NSUInteger total, NSUInteger imported) {
         
-        NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically: Restored %@ keys out of %@", @(imported), @(total));
+        MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically: Restored %@ keys out of %@", @(imported), @(total));
         onComplete();
         
     } failure:^(NSError * _Nonnull error) {
-        NSLog(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error for restoreKeyBackup: %@", error);
+        MXLogDebug(@"[MXKeyBackup] restoreKeyBackupAutomatically. Error for restoreKeyBackup: %@", error);
         onComplete();
     }];
 }
@@ -464,6 +517,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 }
 
 - (void)prepareKeyBackupVersionWithPassword:(NSString *)password
+                                  algorithm:(NSString *)algorithm
                                     success:(void (^)(MXMegolmBackupCreationInfo * _Nonnull))success
                                     failure:(void (^)(NSError * _Nonnull))failure
 {
@@ -471,31 +525,24 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     dispatch_async(cryptoQueue, ^{
         MXStrongifyAndReturnIfNil(self);
 
-        OLMPkDecryption *decryption = [OLMPkDecryption new];
-
-        NSError *error;
-        MXMegolmBackupAuthData *authData = [MXMegolmBackupAuthData new];
-        if (password)
+        Class<MXKeyBackupAlgorithm> algorithmClass = algorithm ? AlgorithmClassesByName[algorithm] : DefaultAlgorithmClass;
+        if (algorithmClass == NULL)
         {
-            // Generate a private key from the password
-            NSString *salt;
-            NSUInteger iterations;
-            NSData *privateKey = [MXKeyBackupPassword generatePrivateKeyWithPassword:password
-                                                                                salt:&salt
-                                                                          iterations:&iterations
-                                                                               error:&error];
-            if (!error)
+            if (failure)
             {
-                authData.publicKey = [decryption setPrivateKey:privateKey error:&error];
-                authData.privateKeySalt = salt;
-                authData.privateKeyIterations = iterations;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSError *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
+                                                         code:MXKeyBackupErrorUnknownAlgorithm
+                                                     userInfo:@{
+                        NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Unknown algorithm (%@) to prepare the backup", algorithm]
+                    }];
+                    failure(error);
+                });
             }
+            return;
         }
-        else
-        {
-            authData.publicKey = [decryption generateKey:&error];
-        }
-
+        NSError *error;
+        MXKeyBackupPreparationInfo *preparationInfo = [algorithmClass prepareWith:password error:&error];
         if (error)
         {
             if (failure)
@@ -506,16 +553,55 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             }
             return;
         }
-        authData.signatures = [self->crypto signObject:authData.signalableJSONDictionary];
-
+        id<MXBaseKeyBackupAuthData> authData = preparationInfo.authData;
+        
         MXMegolmBackupCreationInfo *keyBackupCreationInfo = [MXMegolmBackupCreationInfo new];
-        keyBackupCreationInfo.algorithm = kMXCryptoMegolmBackupAlgorithm;
+        keyBackupCreationInfo.algorithm = [algorithmClass algorithmName];
         keyBackupCreationInfo.authData = authData;
-        keyBackupCreationInfo.recoveryKey = [MXRecoveryKey encode:decryption.privateKey];
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            success(keyBackupCreationInfo);
-        });
+        keyBackupCreationInfo.recoveryKey = [MXRecoveryKey encode:preparationInfo.privateKey];
+        
+        NSString *myUserId = self->crypto.matrixRestClient.credentials.userId;
+        NSMutableDictionary *signatures = [NSMutableDictionary dictionary];
+        
+        NSDictionary *deviceSignature = [self->crypto signObject:authData.signalableJSONDictionary];
+        [signatures addEntriesFromDictionary:deviceSignature[myUserId]];
+        
+        if ([self->crypto.crossSigning canCrossSign] == NO)
+        {
+            authData.signatures = @{myUserId: signatures};
+            keyBackupCreationInfo.authData = authData;
+            
+            if (success)
+            {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    success(keyBackupCreationInfo);
+                });
+            }
+            
+            return;
+        }
+        
+        [self->crypto.crossSigning signObject:authData.signalableJSONDictionary withKeyType:MXCrossSigningKeyType.master success:^(NSDictionary *signedObject) {
+            
+            [signatures addEntriesFromDictionary:signedObject[@"signatures"][myUserId]];
+            
+            authData.signatures = @{myUserId: signatures};
+            keyBackupCreationInfo.authData = authData;
+            
+            if (success)
+            {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    success(keyBackupCreationInfo);
+                });
+            }
+        } failure:^(NSError *error) {
+            if (failure)
+            {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    failure(error);
+                });
+            }
+        }];
     });
 }
 
@@ -631,6 +717,21 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 - (MXHTTPOperation*)forceRefresh:(nullable void (^)(BOOL valid))success
                          failure:(nullable void (^)(NSError *error))failure
 {
+    if (_state == MXKeyBackupStateUnknown || _state == MXKeyBackupStateCheckingBackUpOnHomeserver)
+    {
+        MXLogDebug(@"[MXKeyBackup] forceRefresh: Invalid state (%@) to force the refresh", @(_state));
+        if (failure)
+        {
+            NSError *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
+                                                 code:MXKeyBackupErrorInvalidStateCode
+                                             userInfo:@{
+                                                 NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Invalid state (%@) to force the refresh of the backup", @(_state)]
+                                             }];
+            failure(error);
+        }
+        return nil;
+    }
+    
     // Fetch the last backup version on the server, compare it to the backup version
     // currently used. If versions are not the same, the current backup is forgotten and
     // checkAndStartKeyBackup is called in order to restart on the last version on the HS.
@@ -651,7 +752,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             }
             else
             {
-                NSLog(@"[MXKeyBackup] forceRefresh: New version detected on the homeserver. New version: %@. Old version: %@", serverKeyBackupVersion.version, self.keyBackupVersion.version);
+                MXLogDebug(@"[MXKeyBackup] forceRefresh: New version detected on the homeserver. New version: %@. Old version: %@", serverKeyBackupVersion.version, self.keyBackupVersion.version);
                 usingLastVersion = NO;
 
                 // Stop current backup or start a new one
@@ -688,7 +789,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
         // Reset previous state if any
         [self resetBackupAllGroupSessionsObjects];
 
-        NSLog(@"[MXKeyBackup] backupAllGroupSessions: backupProgress: %@", backupProgress);
+        MXLogDebug(@"[MXKeyBackup] backupAllGroupSessions: backupProgress: %@", backupProgress);
 
         if (progress)
         {
@@ -697,7 +798,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
         if (backupProgress.finished)
         {
-            NSLog(@"[MXKeyBackup] backupAllGroupSessions: complete");
+            MXLogDebug(@"[MXKeyBackup] backupAllGroupSessions: complete");
             if (success)
             {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -806,7 +907,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 {
     MXHTTPOperation *operation = [MXHTTPOperation new];
 
-    NSLog(@"[MXKeyBackup] restoreKeyBackup with recovery key: From backup version: %@", keyBackupVersion.version);
+    MXLogDebug(@"[MXKeyBackup] restoreKeyBackup with recovery key: From backup version: %@", keyBackupVersion.version);
 
     MXWeakify(self);
     dispatch_async(cryptoQueue, ^{
@@ -814,10 +915,11 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
         // Check if the recovery is valid before going any further
         NSError *error;
-        [self isValidRecoveryKey:recoveryKey forKeyBackupVersion:keyBackupVersion error:&error];
-        if (error)
+        BOOL isValidRecoveryKey = [self isValidRecoveryKey:recoveryKey forKeyBackupVersion:keyBackupVersion error:&error];
+        NSData *privateKey = [MXRecoveryKey decode:recoveryKey error:&error];
+        if (error || !isValidRecoveryKey || !privateKey)
         {
-            NSLog(@"[MXKeyBackup] restoreKeyBackup: Invalid recovery key. Error: %@", error);
+            MXLogDebug(@"[MXKeyBackup] restoreKeyBackup: Invalid recovery key. Error: %@", error);
             if (failure)
             {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -827,37 +929,28 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             return;
         }
 
-        // Get the PK decryption instance
-        // The operation always succeeds if the recovery key is valid
-        OLMPkDecryption *decryption = [self pkDecryptionFromRecoveryKey:recoveryKey error:&error];
-        if (decryption)
-        {
-            MXHTTPOperation *operation2 = [self restoreKeyBackup:keyBackupVersion withPkDecryption:decryption room:roomId session:sessionId success:^(NSUInteger total, NSUInteger imported) {
-                
-                // Catch the private key from the recovery key and store it locally
-                if ([self.keyBackupVersion.version isEqualToString:keyBackupVersion.version])
-                {
-                    [self storePrivateKeyWithRecoveryKey:recoveryKey];
-                }
-                
-                if (success)
-                {
-                    success(total, imported);
-                }
-            } failure:failure];
-            [operation mutateTo:operation2];
-        }
-        else if (failure)
-        {
-            failure(error);
-        }
+        MXHTTPOperation *operation2 = [self restoreKeyBackup:keyBackupVersion withPrivateKey:privateKey room:roomId session:sessionId success:^(NSUInteger total, NSUInteger imported) {
+
+            // Catch the private key from the recovery key and store it locally
+            if ([self.keyBackupVersion.version isEqualToString:keyBackupVersion.version])
+            {
+                [self storePrivateKeyWithRecoveryKey:recoveryKey];
+            }
+
+            if (success)
+            {
+                success(total, imported);
+            }
+        } failure:failure];
+
+        [operation mutateTo:operation2];
     });
 
     return operation;
 }
 
 - (MXHTTPOperation*)restoreKeyBackup:(MXKeyBackupVersion*)keyBackupVersion
-                    withPkDecryption:(OLMPkDecryption*)decryption
+                      withPrivateKey:(NSData*)privateKey
                                 room:(nullable NSString*)roomId
                              session:(nullable NSString*)sessionId
                              success:(nullable void (^)(NSUInteger total, NSUInteger imported))success
@@ -878,8 +971,9 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             {
                 sessionsFromHSCount++;
                 MXKeyBackupData *keyBackupData = keysBackupData.rooms[roomId].sessions[sessionId];
-                
-                MXMegolmSessionData *sessionData = [self decryptKeyBackupData:keyBackupData forSession:sessionId inRoom:roomId withPkDecryption:decryption];
+
+                id<MXKeyBackupAlgorithm> algorithm = [self getOrCreateKeyBackupAlgorithmFor:keyBackupVersion privateKey:privateKey];
+                MXMegolmSessionData *sessionData = [algorithm decryptKeyBackupData:keyBackupData forSession:sessionId inRoom:roomId];
                 
                 if (sessionData)
                 {
@@ -888,13 +982,13 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             }
         }
         
-        NSLog(@"[MXKeyBackup] restoreKeyBackup: Decrypted %@ keys out of %@ from the backup store on the homeserver", @(sessionDatas.count), @(sessionsFromHSCount));
+        MXLogDebug(@"[MXKeyBackup] restoreKeyBackup: Decrypted %@ keys out of %@ from the backup store on the homeserver", @(sessionDatas.count), @(sessionsFromHSCount));
         
         // Do not trigger a backup for them if they come from the backup version we are using
         BOOL backUp = ![keyBackupVersion.version isEqualToString:self.keyBackupVersion.version];
         if (backUp)
         {
-            NSLog(@"[MXKeyBackup] restoreKeyBackup: Those keys will be backed up to backup version: %@", self.keyBackupVersion.version);
+            MXLogDebug(@"[MXKeyBackup] restoreKeyBackup: Those keys will be backed up to backup version: %@", self.keyBackupVersion.version);
         }
         
         // Import them into the crypto store
@@ -926,7 +1020,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 {
     MXHTTPOperation *operation = [MXHTTPOperation new];
 
-    NSLog(@"[MXKeyBackup] restoreKeyBackup with password: From backup version: %@", keyBackupVersion.version);
+    MXLogDebug(@"[MXKeyBackup] restoreKeyBackup with password: From backup version: %@", keyBackupVersion.version);
 
     MXWeakify(self);
     dispatch_async(cryptoQueue, ^{
@@ -963,43 +1057,33 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 {
     MXHTTPOperation *operation = [MXHTTPOperation new];
     
-    NSLog(@"[MXKeyBackup] restoreUsingPrivateKeyKeyBackup: From backup version: %@", keyBackupVersion.version);
+    MXLogDebug(@"[MXKeyBackup] restoreUsingPrivateKeyKeyBackup: From backup version: %@", keyBackupVersion.version);
     
     MXWeakify(self);
     dispatch_async(cryptoQueue, ^{
         MXStrongifyAndReturnIfNil(self);
-        
-        // Get the PK decryption instance
-        OLMPkDecryption *decryption = [self pkDecryptionFromCryptoStore];
-        
-        // Validate the local private key
-        if (decryption)
+
+        NSData *privateKey = self.privateKeyFromCryptoStore;
+        NSError *error;
+        if (error || ![[self getOrCreateKeyBackupAlgorithmFor:keyBackupVersion privateKey:privateKey] keyMatches:privateKey error:&error])
         {
-            NSString *pKDecryptionPublicKey = [self pkDecrytionPublicKeyFromCryptoStore];
-            if (![self checkPkDecryptionPublicKey:pKDecryptionPublicKey forKeyBackupVersion:keyBackupVersion])
+            MXLogDebug(@"[MXKeyBackup] restoreUsingPrivateKeyKeyBackup. Error: Private key does not match: %@, for: %@", error, keyBackupVersion);
+            if (failure)
             {
-                NSLog(@"[MXKeyBackup] restoreUsingPrivateKeyKeyBackup. Error: Invalid private key (%@) for %@", pKDecryptionPublicKey, keyBackupVersion);
-                decryption = nil;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSError *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
+                                                         code:MXKeyBackupErrorInvalidOrMissingLocalPrivateKey
+                                                     userInfo:@{
+                        NSLocalizedDescriptionKey: @"Backup: No valid private key"
+                    }];
+                    failure(error);
+                });
             }
         }
-        
-        if (decryption)
-        {
-            // Launch the restore
-            MXHTTPOperation *operation2 = [self restoreKeyBackup:keyBackupVersion withPkDecryption:decryption room:roomId session:sessionId success:success failure:failure];
-            [operation mutateTo:operation2];
-        }
-        else if (failure)
-        {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSError *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
-                                                     code:MXKeyBackupErrorInvalidOrMissingLocalPrivateKey
-                                                 userInfo:@{
-                                                            NSLocalizedDescriptionKey: @"Backup: No valid private key"
-                                                            }];
-                failure(error);
-            });
-        }
+
+        // Launch the restore
+        MXHTTPOperation *operation2 = [self restoreKeyBackup:keyBackupVersion withPrivateKey:privateKey room:roomId session:sessionId success:success failure:failure];
+        [operation mutateTo:operation2];
     });
     
     return operation;
@@ -1032,20 +1116,25 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     MXKeyBackupVersionTrust *keyBackupVersionTrust = [MXKeyBackupVersionTrust new];
 
     NSError *error;
-    MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
+    id<MXBaseKeyBackupAuthData> authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
     if (error)
     {
-        NSLog(@"[MXKeyBackup] trustForKeyBackupVersion: Key backup is absent or missing required data");
+        MXLogDebug(@"[MXKeyBackup] trustForKeyBackupVersion: Key backup is absent or missing required data");
         return keyBackupVersionTrust;
+    }
+
+    NSData *privateKey = self.privateKeyFromCryptoStore;
+    if (privateKey)
+    {
+        id<MXKeyBackupAlgorithm> algorithm = [self getOrCreateKeyBackupAlgorithmFor:keyBackupVersion privateKey:privateKey];
+        if ([algorithm keyMatches:privateKey error:nil])
+        {
+            MXLogDebug(@"[MXKeyBackup] trustForKeyBackupVersionFromCryptoQueue: Backup is trusted locally");
+            keyBackupVersionTrust.trustedLocally = YES;
+        }
     }
 
     NSDictionary *mySigs = authData.signatures[myUserId];
-    if (mySigs.count == 0)
-    {
-        NSLog(@"[MXKeyBackup] trustForKeyBackupVersion: Ignoring key backup because it lacks any signatures from this user");
-        return keyBackupVersionTrust;
-    }
-
     NSMutableArray<MXKeyBackupVersionTrustSignature*> *signatures = [NSMutableArray array];
     for (NSString *keyId in mySigs)
     {
@@ -1069,27 +1158,45 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
                 if (!valid)
                 {
-                    NSLog(@"[MXKeyBackup] trustForKeyBackupVersion: Bad signature from device %@: %@", device.deviceId, error);
+                    MXLogDebug(@"[MXKeyBackup] trustForKeyBackupVersion: Bad signature from device %@: %@", device.deviceId, error);
                 }
-                else if (device.trustLevel.isVerified)
-                {
-                    keyBackupVersionTrust.usable = YES;
-                }
+                
+                MXKeyBackupVersionTrustSignature *signature = [MXKeyBackupVersionTrustSignature new];
+                signature.deviceId = deviceId;
+                signature.device = device;
+                signature.valid = valid;
+                [signatures addObject:signature];
             }
-            else
+            else // Try interpreting it as the MSK public key
             {
-                NSLog(@"[MXKeyBackup] trustForKeyBackupVersion: Signature from unknown key %@", deviceId);
+                NSError *error;
+                BOOL valid = [crypto.crossSigning.crossSigningTools pkVerifyObject:authData.JSONDictionary userId:myUserId publicKey:deviceId error:&error];
+                
+                if (!valid)
+                {
+                    MXLogDebug(@"[MXKeyBackup] trustForKeyBackupVersion: Signature with unknown key %@", deviceId);
+                }
+                else
+                {
+                    MXKeyBackupVersionTrustSignature *signature = [MXKeyBackupVersionTrustSignature new];
+                    signature.keys = deviceId;
+                    signature.valid = valid;
+                    [signatures addObject:signature];
+                }
             }
-
-            MXKeyBackupVersionTrustSignature *signature = [MXKeyBackupVersionTrustSignature new];
-            signature.deviceId = deviceId;
-            signature.device = device;
-            signature.valid = valid;
-            [signatures addObject:signature];
         }
     }
 
     keyBackupVersionTrust.signatures = signatures;
+
+    for (MXKeyBackupVersionTrustSignature *signature in keyBackupVersionTrust.signatures)
+    {
+        if (signature.valid && signature.device && signature.device.trustLevel.isVerified)
+        {
+            keyBackupVersionTrust.usable = YES;
+        }
+    }
+    keyBackupVersionTrust.usable = keyBackupVersionTrust.usable || keyBackupVersionTrust.isTrustedLocally;
 
     return keyBackupVersionTrust;
 }
@@ -1099,7 +1206,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
                                    success:(void (^)(void))success
                                    failure:(void (^)(NSError * _Nonnull))failure
 {
-    NSLog(@"[MXKeyBackup] trustKeyBackupVersion:trust: %@. trust: %@", keyBackupVersion.version, @(trust));
+    MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:trust: %@. trust: %@", keyBackupVersion.version, @(trust));
 
     MXHTTPOperation *operation = [MXHTTPOperation new];
 
@@ -1111,10 +1218,10 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
         // Get auth data to update it
         NSError *error;
-        MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
+        id<MXBaseKeyBackupAuthData> authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
         if (error)
         {
-            NSLog(@"[MXKeyBackup] trustKeyBackupVersion:trust: Key backup is missing required data");
+            MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:trust: Key backup is missing required data");
 
             if (failure)
             {
@@ -1171,7 +1278,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
             }
         } failure:^(NSError *error) {
             
-            NSLog(@"[MXKeyBackup] trustKeyBackupVersion:trust: Error: %@", error);
+            MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:trust: Error: %@", error);
             if (failure)
             {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -1190,7 +1297,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
                                    success:(void (^)(void))success
                                    failure:(void (^)(NSError * _Nonnull))failure
 {
-    NSLog(@"[MXKeyBackup] trustKeyBackupVersion:withRecoveryKey: %@", keyBackupVersion.version);
+    MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:withRecoveryKey: %@", keyBackupVersion.version);
 
     MXHTTPOperation *operation = [MXHTTPOperation new];
 
@@ -1207,7 +1314,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
         }
         else
         {
-            NSLog(@"[MXKeyBackup] trustKeyBackupVersion:withRecoveryKey: Invalid recovery key. Error: %@", error);
+            MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:withRecoveryKey: Invalid recovery key. Error: %@", error);
 
             if (failure)
             {
@@ -1226,7 +1333,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
                                    success:(void (^)(void))success
                                    failure:(void (^)(NSError * _Nonnull))failure
 {
-    NSLog(@"[MXKeyBackup] trustKeyBackupVersion:withPassword: %@", keyBackupVersion.version);
+    MXLogDebug(@"[MXKeyBackup] trustKeyBackupVersion:withPassword: %@", keyBackupVersion.version);
 
     MXHTTPOperation *operation = [MXHTTPOperation new];
 
@@ -1265,7 +1372,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
                 onPrivateKeysReceived:(void (^)(void))onPrivateKeysReceived
                               failure:(void (^)(NSError *error))failure
 {
-    NSLog(@"[MXKeyBackup] requestPrivateKeysToDeviceIds: %@", deviceIds);
+    MXLogDebug(@"[MXKeyBackup] requestPrivateKeysToDeviceIds: %@", deviceIds);
 
     MXWeakify(self);
     [crypto.secretShareManager requestSecret:MXSecretId.keyBackup toDeviceIds:deviceIds success:^(NSString * _Nonnull requestId) {
@@ -1275,7 +1382,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
         BOOL isSecretValid = !self.keyBackupVersion     // Accept the secret if the backup is not known yet
         || [self isSecretValid:secret forKeyBackupVersion:self.keyBackupVersion];
         
-        NSLog(@"[MXKeyBackup] requestPrivateKeysToDeviceIds: Got key. isSecretValid: %@", @(isSecretValid));
+        MXLogDebug(@"[MXKeyBackup] requestPrivateKeysToDeviceIds: Got key. isSecretValid: %@", @(isSecretValid));
         if (isSecretValid)
         {
             [self->crypto.store storeSecret:secret withSecretId:MXSecretId.keyBackup];
@@ -1287,18 +1394,10 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
 - (BOOL)isSecretValid:(NSString*)secret forKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion
 {
-    BOOL isSecretValid = NO;
-    
     NSData *privateKey = [MXBase64Tools dataFromBase64:secret];
-    NSString *pKDecryptionPublicKey = [self pkDecrytionPublicKeyFromPrivateKey:privateKey];
-    if ([self checkPkDecryptionPublicKey:pKDecryptionPublicKey forKeyBackupVersion:keyBackupVersion])
-    {
-        isSecretValid = YES;
-    }
-    
-    return isSecretValid;
+    id<MXKeyBackupAlgorithm> algorithm = [self getOrCreateKeyBackupAlgorithmFor:keyBackupVersion privateKey:privateKey];
+    return [algorithm keyMatches:privateKey error:nil];
 }
-
 
 #pragma mark - Backup state
 
@@ -1312,12 +1411,48 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     return [crypto.store inboundGroupSessionsToBackup:1].count > 0;
 }
 
+- (BOOL)canBeRefreshed
+{
+    return _state != MXKeyBackupStateUnknown && _state != MXKeyBackupStateCheckingBackUpOnHomeserver;
+}
 
 #pragma mark - Private methods -
 
+- (id<MXKeyBackupAlgorithm>)getOrCreateKeyBackupAlgorithmFor:(MXKeyBackupVersion*)keyBackupVersion privateKey:(NSData*)privateKey
+{
+    if (self.enabled
+        && [_keyBackupVersion.JSONDictionary isEqualToDictionary:keyBackupVersion.JSONDictionary]
+        && [self.privateKeyFromCryptoStore isEqualToData:privateKey])
+    {
+        return _keyBackupAlgorithm;
+    }
+    Class<MXKeyBackupAlgorithm> algorithmClass = AlgorithmClassesByName[keyBackupVersion.algorithm];
+    if (algorithmClass == NULL)
+    {
+        NSString *message = [NSString stringWithFormat:@"[MXKeyBackup] getOrCreateKeyBackupAlgorithmFor: unknown algorithm: %@", keyBackupVersion.algorithm];
+        MXLogError(message);
+        return nil;
+    }
+    if (![algorithmClass checkBackupVersion:keyBackupVersion])
+    {
+        MXLogError(@"[MXKeyBackup] getOrCreateKeyBackupAlgorithmFor: invalid backup data returned");
+        return nil;
+    }
+    NSError *error;
+    id<MXBaseKeyBackupAuthData> authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
+    if (error)
+    {
+        MXLogError(@"[MXKeyBackup] getOrCreateKeyBackupAlgorithmFor: invalid auth data");
+        return nil;
+    }
+    return [[algorithmClass.class alloc] initWithCrypto:crypto authData:authData keyGetterBlock:^NSData * _Nullable{
+        return privateKey;
+    }];
+}
+
 - (void)setState:(MXKeyBackupState)state
 {
-    NSLog(@"[MXKeyBackup] setState: %@ -> %@", @(_state), @(state));
+    MXLogDebug(@"[MXKeyBackup] setState: %@ -> %@", @(_state), @(state));
 
     _state = state;
 
@@ -1391,31 +1526,13 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     return decryption;
 }
 
-- (NSString*)pkPublicKeyFromRecoveryKey:(NSString*)recoveryKey error:(NSError **)error
-{
-    NSString *pkPublicKey;
-
-    // Extract the private key
-    NSData *privateKey = [MXRecoveryKey decode:recoveryKey error:error];
-
-    // Built the PK decryption with it
-    OLMPkDecryption *decryption;
-    if (privateKey)
-    {
-        decryption = [OLMPkDecryption new];
-        pkPublicKey = [decryption setPrivateKey:privateKey error:error];
-    }
-
-    return pkPublicKey;
-}
-
 - (void)storePrivateKeyWithRecoveryKey:(NSString*)recoveryKey
 {
     NSError *error;
     OLMPkDecryption *decryption = [self pkDecryptionFromRecoveryKey:recoveryKey error:&error];
     if (!decryption)
     {
-        NSLog(@"[MXKeyBackup] storePrivateKeyWithRecoveryKey] Cannot create OLMPkDecryption. Error: %@", error);
+        MXLogDebug(@"[MXKeyBackup] storePrivateKeyWithRecoveryKey] Cannot create OLMPkDecryption. Error: %@", error);
         return;
     }
     
@@ -1425,170 +1542,14 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
 - (nullable NSData*)privateKeyFromCryptoStore
 {
-    NSString *privateKeyBase64 = [self->crypto.store secretWithSecretId:MXSecretId.keyBackup];
+    NSString *privateKeyBase64 = [crypto.store secretWithSecretId:MXSecretId.keyBackup];
     if (!privateKeyBase64)
     {
-        NSLog(@"[MXCrossSigning] privateKeyFromCryptoStore. Error: No secret in crypto store");
+        MXLogDebug(@"[MXKeyBackup] privateKeyFromCryptoStore. Error: No secret in crypto store");
         return nil;
     }
-    
+
     return [MXBase64Tools dataFromBase64:privateKeyBase64];
-}
-
-- (nullable OLMPkDecryption*)pkDecryptionFromCryptoStore
-{
-    NSData *privateKey = self.privateKeyFromCryptoStore;
-
-    // Built the PK decryption with it
-    OLMPkDecryption *decryption;
-    if (privateKey)
-    {
-        NSError *error;
-        decryption = [OLMPkDecryption new];
-        [decryption setPrivateKey:privateKey error:&error];
-        
-        if (error)
-        {
-            NSLog(@"[MXCrossSigning] pkDecryptionFromCryptoStore failed. Error: %@", error);
-        }
-    }
-
-    return decryption;
-}
-
-- (nullable NSString*)pkDecrytionPublicKeyFromCryptoStore
-{
-    NSData *privateKey = self.privateKeyFromCryptoStore;
-    return [self pkDecrytionPublicKeyFromPrivateKey:privateKey];
-}
-
-- (nullable NSString*)pkDecrytionPublicKeyFromPrivateKey:(NSData*)privateKey
-{
-    NSString *pkPublicKey;
-    
-    // Built the PK decryption with it
-    OLMPkDecryption *decryption;
-    if (privateKey)
-    {
-        NSError *error;
-        decryption = [OLMPkDecryption new];
-        pkPublicKey = [decryption setPrivateKey:privateKey error:&error];
-        
-        if (error)
-        {
-            NSLog(@"[MXCrossSigning] pkDecrytionPublicKeyFromPrivateKey failed. Error: %@", error);
-        }
-    }
-    
-    return pkPublicKey;
-}
-
-- (BOOL)checkPkDecryptionPublicKey:(NSString*)pKDecryptionPublicKey forKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion
-{
-    BOOL checkPkDecryptionPublicKey = NO;
-    
-    NSError *error;
-    MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:&error];
-    if ([pKDecryptionPublicKey isEqualToString:authData.publicKey])
-    {
-        checkPkDecryptionPublicKey = YES;
-    }
-    
-    if (error)
-    {
-        NSLog(@"[MXCrossSigning] checkPkDecryptionPublicKey: Error: %@", error);
-    }
-    
-    return checkPkDecryptionPublicKey;
-}
-
-- (nullable OLMPkSigning*)pkSigningFromPrivateKey:(NSData*)privateKey withExpectedPublicKey:(NSString*)expectedPublicKey
-{
-    NSError *error;
-    OLMPkSigning *pkSigning = [[OLMPkSigning alloc] init];
-    NSString *gotPublicKey = [pkSigning doInitWithSeed:privateKey error:&error];
-    if (error)
-    {
-        NSLog(@"[MXCrossSigning] pkSigningFromPrivateKey failed to build PK signing. Error: %@", error);
-        return nil;
-    }
-    
-    if (![gotPublicKey isEqualToString:expectedPublicKey])
-    {
-        NSLog(@"[MXCrossSigning] pkSigningFromPrivateKey failed. Keys do not match: %@ vs %@", gotPublicKey, expectedPublicKey);
-        return nil;
-    }
-    
-    return pkSigning;
-}
-
-- (MXKeyBackupData*)encryptGroupSession:(MXOlmInboundGroupSession*)session
-{
-    // Gather information for each key
-    MXDeviceInfo *device = [crypto.deviceList deviceWithIdentityKey:session.senderKey andAlgorithm:kMXCryptoMegolmAlgorithm];
-
-    // Build the m.megolm_backup.v1.curve25519-aes-sha2 data as defined at
-    // https://github.com/uhoreg/matrix-doc/blob/e2e_backup/proposals/1219-storing-megolm-keys-serverside.md#mmegolm_backupv1curve25519-aes-sha2-key-format
-    MXMegolmSessionData *sessionData = session.exportSessionData;
-    NSDictionary *sessionBackupData = @{
-                                        @"algorithm": sessionData.algorithm,
-                                        @"sender_key": sessionData.senderKey,
-                                        @"sender_claimed_keys": sessionData.senderClaimedKeys,
-                                        @"forwarding_curve25519_key_chain": sessionData.forwardingCurve25519KeyChain ?  sessionData.forwardingCurve25519KeyChain : @[],
-                                        @"session_key": sessionData.sessionKey
-                                        };
-    OLMPkMessage *encryptedSessionBackupData = [_backupKey encryptMessage:[MXTools serialiseJSONObject:sessionBackupData] error:nil];
-
-    // Build backup data for that key
-    MXKeyBackupData *keyBackupData = [MXKeyBackupData new];
-    keyBackupData.firstMessageIndex = session.session.firstKnownIndex;
-    keyBackupData.forwardedCount = session.forwardingCurve25519KeyChain.count;
-    keyBackupData.verified = device.trustLevel.isVerified;
-    keyBackupData.sessionData = @{
-                                  @"ciphertext": encryptedSessionBackupData.ciphertext,
-                                  @"mac": encryptedSessionBackupData.mac,
-                                  @"ephemeral": encryptedSessionBackupData.ephemeralKey,
-                                  };
-
-    return keyBackupData;
-}
-
-- (MXMegolmSessionData*)decryptKeyBackupData:(MXKeyBackupData*)keyBackupData forSession:(NSString*)sessionId inRoom:(NSString*)roomId withPkDecryption:(OLMPkDecryption*)decryption
-{
-    MXMegolmSessionData *sessionData;
-
-    NSString *ciphertext, *mac, *ephemeralKey;
-
-    MXJSONModelSetString(ciphertext, keyBackupData.sessionData[@"ciphertext"]);
-    MXJSONModelSetString(mac, keyBackupData.sessionData[@"mac"]);
-    MXJSONModelSetString(ephemeralKey, keyBackupData.sessionData[@"ephemeral"]);
-
-    if (ciphertext && mac && ephemeralKey)
-    {
-        OLMPkMessage *encrypted = [[OLMPkMessage alloc] initWithCiphertext:ciphertext mac:mac ephemeralKey:ephemeralKey];
-
-        NSError *error;
-        NSString *text = [decryption decryptMessage:encrypted error:&error];
-
-        if (!error)
-        {
-            NSDictionary *sessionBackupData = [MXTools deserialiseJSONString:text];
-
-            if (sessionBackupData)
-            {
-                MXJSONModelSetMXJSONModel(sessionData, MXMegolmSessionData, sessionBackupData);
-
-                sessionData.sessionId = sessionId;
-                sessionData.roomId = roomId;
-            }
-        }
-        else
-        {
-            NSLog(@"[MXKeyBackup] decryptKeyBackupData: Failed to decrypt session from backup. Error: %@", error);
-        }
-    }
-
-    return sessionData;
 }
 
 /**
@@ -1598,25 +1559,24 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
  @param error the encountered error in case of failure.
  @return the authentication if found and valid.
  */
-- (nullable MXMegolmBackupAuthData *)megolmBackupAuthDataFromKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion error:(NSError**)error
+- (nullable id<MXBaseKeyBackupAuthData>)megolmBackupAuthDataFromKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion error:(NSError**)error
 {
-    MXMegolmBackupAuthData *authData = [MXMegolmBackupAuthData modelFromJSON:keyBackupVersion.authData];
-    if (keyBackupVersion.algorithm && authData.publicKey && authData.signatures)
+    Class<MXKeyBackupAlgorithm> algorithmClass = AlgorithmClassesByName[keyBackupVersion.algorithm];
+    if (algorithmClass == NULL)
     {
-        return authData;
-    }
-    else
-    {
-        NSLog(@"[MXKeyBackup] megolmBackupAuthDataFromKeyBackupVersion: Key backup is missing required data");
+        NSString *message = [NSString stringWithFormat:@"[MXKeyBackup] megolmBackupAuthDataFromKeyBackupVersion: Key backup for unknown algorithm: %@", keyBackupVersion.algorithm];
+        MXLogError(message);
 
         *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
-                                     code:MXKeyBackupErrorMissingAuthDataCode
+                                     code:MXKeyBackupErrorUnknownAlgorithm
                                  userInfo:@{
-                                            NSLocalizedDescriptionKey: @"Key backup is missing required data"
-                                            }];
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Unknown algorithm (%@) for the backup", keyBackupVersion.algorithm]
+        }];
 
         return nil;
     }
+
+    return [algorithmClass authDataFromJSON:keyBackupVersion.authData error:error];
 }
 
 /**
@@ -1629,8 +1589,8 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
  */
 - (nullable NSString*)recoveryKeyFromPassword:(NSString*)password inKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion error:(NSError **)error
 {
-    // Extract MXMegolmBackupAuthData
-    MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:error];
+    // Extract MXBaseKeyBackupAuthData
+    id<MXBaseKeyBackupAuthData> authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:error];
     if (*error)
     {
         return nil;
@@ -1638,7 +1598,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
 
     if (!authData.privateKeySalt || !authData.privateKeyIterations)
     {
-        NSLog(@"[MXKeyBackup] recoveryFromPassword: Salt and/or iterations not found in key backup auth data");
+        MXLogDebug(@"[MXKeyBackup] recoveryFromPassword: Salt and/or iterations not found in key backup auth data");
         *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
                                      code:MXKeyBackupErrorMissingPrivateKeySaltCode
                                  userInfo:@{
@@ -1652,7 +1612,7 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
     NSData *recoveryKeyData = [MXKeyBackupPassword retrievePrivateKeyWithPassword:password salt:authData.privateKeySalt iterations:authData.privateKeyIterations error:error];
     if (*error)
     {
-        NSLog(@"[MXKeyBackup] recoveryFromPassword: retrievePrivateKeyWithPassword failed: %@", *error);
+        MXLogDebug(@"[MXKeyBackup] recoveryFromPassword: retrievePrivateKeyWithPassword failed: %@", *error);
         return nil;
     }
 
@@ -1669,43 +1629,47 @@ NSUInteger const kMXKeyBackupSendKeysMaxCount = 100;
  */
 - (BOOL)isValidRecoveryKey:(NSString*)recoveryKey forKeyBackupVersion:(MXKeyBackupVersion*)keyBackupVersion error:(NSError **)error
 {
-    // Build PK decryption instance with the recovery key
-    NSString *publicKey = [self pkPublicKeyFromRecoveryKey:recoveryKey error:error];
+    NSData *privateKey = [MXRecoveryKey decode:recoveryKey error:error];
+
     if (*error)
     {
-        NSLog(@"[MXKeyBackup] isValidRecoveryKey: Invalid recovery key. Error: %@", *error);
+        MXLogDebug(@"[MXKeyBackup] isValidRecoveryKey: Invalid recovery key. Error: %@", *error);
 
         // Return a generic error
         *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
                                      code:MXKeyBackupErrorInvalidRecoveryKeyCode
                                  userInfo:@{
-                                            NSLocalizedDescriptionKey: @"Invalid recovery key or password"
-                                            }];
+            NSLocalizedDescriptionKey: @"Invalid recovery key or password"
+        }];
         return NO;
     }
 
-    // Get the public key defined in the backup
-    MXMegolmBackupAuthData *authData = [self megolmBackupAuthDataFromKeyBackupVersion:keyBackupVersion error:error];
-    if (*error)
+    Class<MXKeyBackupAlgorithm> algorithm = AlgorithmClassesByName[keyBackupVersion.algorithm];
+    if (algorithm == NULL)
     {
-        NSLog(@"[MXKeyBackup] isValidRecoveryKey: Key backup is missing required data");
+        MXLogDebug(@"[MXKeyBackup] isValidRecoveryKey: unknown algorithm: %@", keyBackupVersion.algorithm);
+
+        *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
+                                     code:MXKeyBackupErrorUnknownAlgorithm
+                                 userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Unknown algorithm (%@)", keyBackupVersion.algorithm]
+        }];
         return NO;
     }
+    BOOL result = [algorithm keyMatches:privateKey withAuthData:keyBackupVersion.authData error:error];
 
-    // Compare both
-    if (![publicKey isEqualToString:authData.publicKey])
+    if (!result)
     {
-        NSLog(@"[MXKeyBackup] isValidRecoveryKey: Public keys mismatch");
+        MXLogDebug(@"[MXKeyBackup] isValidRecoveryKey: Public keys mismatch");
 
         *error = [NSError errorWithDomain:MXKeyBackupErrorDomain
                                      code:MXKeyBackupErrorInvalidRecoveryKeyCode
                                  userInfo:@{
-                                            NSLocalizedDescriptionKey: @"Invalid recovery key or password"
-                                            }];
-        return NO;
+            NSLocalizedDescriptionKey: @"Invalid recovery key or password: public keys mismatch"
+        }];
     }
 
-    return YES;
+    return result;
 }
 
 @end

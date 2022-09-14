@@ -2,6 +2,7 @@
  Copyright 2014 OpenMarket Ltd
  Copyright 2017 Vector Creations Ltd
  Copyright 2018 New Vector Ltd
+ Copyright 2020 The Matrix.org Foundation C.I.C
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -21,11 +22,14 @@
 #import "MXBackgroundModeHandler.h"
 #import "MXEnumConstants.h"
 #import "MXFileRoomStore.h"
+#import "MXFileRoomOutgoingMessagesStore.h"
 #import "MXFileStoreMetaData.h"
 #import "MXSDKOptions.h"
 #import "MXTools.h"
+#import "MatrixSDKSwiftHeader.h"
+#import "MXFileRoomSummaryStore.h"
 
-static NSUInteger const kMXFileVersion = 67;
+static NSUInteger const kMXFileVersion = 81;
 
 static NSString *const kMXFileStoreFolder = @"MXFileStore";
 static NSString *const kMXFileStoreMedaDataFile = @"MXFileStore";
@@ -38,8 +42,8 @@ static NSString *const kMXFileStoreSavingMarker = @"savingMarker";
 
 static NSString *const kMXFileStoreRoomsFolder = @"rooms";
 static NSString *const kMXFileStoreRoomMessagesFile = @"messages";
+static NSString *const kMXFileStoreRoomOutgoingMessagesFile = @"outgoingMessages";
 static NSString *const kMXFileStoreRoomStateFile = @"state";
-static NSString *const kMXFileStoreRoomSummaryFile = @"summary";
 static NSString *const kMXFileStoreRoomAccountDataFile = @"accountData";
 static NSString *const kMXFileStoreRoomReadReceiptsFile = @"readReceipts";
 
@@ -53,10 +57,10 @@ static NSUInteger preloadOptions;
 
     // List of rooms to save on [MXStore commit]
     NSMutableArray *roomsToCommitForMessages;
+    
+    NSMutableArray *roomsToCommitForOutgoingMessages;
 
     NSMutableDictionary *roomsToCommitForState;
-
-    NSMutableDictionary<NSString*, MXRoomSummary*> *roomsToCommitForSummary;
 
     NSMutableDictionary<NSString*, MXRoomAccountData*> *roomsToCommitForAccountData;
     
@@ -95,8 +99,7 @@ static NSUInteger preloadOptions;
     // when it will read rooms states.
     NSMutableDictionary<NSString*, NSArray*> *preloadedRoomsStates;
 
-    // Same kind of cache for room summary and room account data.
-    NSMutableDictionary<NSString*, MXRoomSummary*> *preloadedRoomSummary;
+    // Same kind of cache for room account data.
     NSMutableDictionary<NSString*, MXRoomAccountData*> *preloadedRoomAccountData;
 
     // File reading and writing operations are dispatched to a separated thread.
@@ -121,13 +124,15 @@ static NSUInteger preloadOptions;
 
 @implementation MXFileStore
 
+@synthesize roomSummaryStore;
+
 + (void)initialize
 {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
 
         // By default, we do not need to preload rooms states now
-        preloadOptions = MXFileStorePreloadOptionRoomSummary | MXFileStorePreloadOptionRoomAccountData;
+        preloadOptions = MXFileStorePreloadOptionRoomAccountData;
     });
 }
 
@@ -137,8 +142,8 @@ static NSUInteger preloadOptions;
     if (self)
     {
         roomsToCommitForMessages = [NSMutableArray array];
+        roomsToCommitForOutgoingMessages = [NSMutableArray array];
         roomsToCommitForState = [NSMutableDictionary dictionary];
-        roomsToCommitForSummary = [NSMutableDictionary dictionary];
         roomsToCommitForAccountData = [NSMutableDictionary dictionary];
         roomsToCommitForReceipts = [NSMutableArray array];
         roomsToCommitForDeletion = [NSMutableArray array];
@@ -146,7 +151,6 @@ static NSUInteger preloadOptions;
         groupsToCommit = [NSMutableDictionary dictionary];
         groupsToCommitForDeletion = [NSMutableArray array];
         preloadedRoomsStates = [NSMutableDictionary dictionary];
-        preloadedRoomSummary = [NSMutableDictionary dictionary];
         preloadedRoomAccountData = [NSMutableDictionary dictionary];
 
         metaDataHasChanged = NO;
@@ -164,21 +168,34 @@ static NSUInteger preloadOptions;
     if (self)
     {
         credentials = someCredentials;
+        [self setupRoomSummaryStore];
         [self setUpStoragePaths];
     }
     return self;
+}
+
+- (void)setupRoomSummaryStore
+{
+    NSParameterAssert(credentials);
+    
+    if (!roomSummaryStore)
+    {
+        roomSummaryStore = [[MXCoreDataRoomSummaryStore alloc] initWithCredentials:credentials];
+    }
 }
 
 - (void)openWithCredentials:(MXCredentials*)someCredentials onComplete:(void (^)(void))onComplete failure:(void (^)(NSError *))failure
 {
     credentials = someCredentials;
     
+    [self setupRoomSummaryStore];
+    
     // Create the file path where data will be stored for the user id passed in credentials
     [self setUpStoragePaths];
 
     id<MXBackgroundModeHandler> handler = [MXSDKOptions sharedInstance].backgroundModeHandler;
     
-    id<MXBackgroundTask> backgroundTask = [handler startBackgroundTaskWithName:@"[MXFileStore] openWithCredentials:onComplete:failure:" expirationHandler:nil];
+    id<MXBackgroundTask> backgroundTask = [handler startBackgroundTaskWithName:@"[MXFileStore] openWithCredentials:onComplete:failure:"];
 
     /*
     Mount data corresponding to the account credentials.
@@ -188,7 +205,7 @@ static NSUInteger preloadOptions;
 
 #if DEBUG
     [self diskUsageWithBlock:^(NSUInteger diskUsage) {
-        NSLog(@"[MXFileStore] diskUsage: %@", [NSByteCountFormatter stringFromByteCount:diskUsage countStyle:NSByteCountFormatterCountStyleFile]);
+        MXLogDebug(@"[MXFileStore] diskUsage: %@", [NSByteCountFormatter stringFromByteCount:diskUsage countStyle:NSByteCountFormatterCountStyleFile]);
     }];
 #endif
 
@@ -206,11 +223,11 @@ static NSUInteger preloadOptions;
             // Check store version
             if (self->metaData && kMXFileVersion != self->metaData.version)
             {
-                NSLog(@"[MXFileStore] New MXFileStore version detected");
+                MXLogDebug(@"[MXFileStore] New MXFileStore version detected");
 
                 if (self->metaData.version <= 35)
                 {
-                    NSLog(@"[MXFileStore] Matrix SDK until the version of 35 of MXFileStore caches all NSURLRequests unnecessarily. Clear NSURLCache");
+                    MXLogDebug(@"[MXFileStore] Matrix SDK until the version of 35 of MXFileStore caches all NSURLRequests unnecessarily. Clear NSURLCache");
                     [[NSURLCache sharedURLCache] removeAllCachedResponses];
                 }
 
@@ -220,30 +237,32 @@ static NSUInteger preloadOptions;
             // If metaData is still defined, we can load rooms data
             if (self->metaData)
             {                
-                MXTaskProfile *taskProfile = [MXSDKOptions.sharedInstance.profiler startMeasuringTaskWithName:kMXAnalyticsStartupStorePreload category:kMXAnalyticsStartupCategory];
+                MXTaskProfile *taskProfile = [MXSDKOptions.sharedInstance.profiler startMeasuringTaskWithName:MXTaskProfileNameStartupStorePreload];
                 
-                NSLog(@"[MXFileStore] Start data loading from files");
+                MXLogDebug(@"[MXFileStore] Start data loading from files");
 
-                [self loadRoomsMessages];
+                if (preloadOptions & MXFileStorePreloadOptionRoomMessages)
+                {
+                    [self preloadRoomsMessages];
+                }
                 if (preloadOptions & MXFileStorePreloadOptionRoomState)
                 {
                     [self preloadRoomsStates];
-                }
-                if (preloadOptions & MXFileStorePreloadOptionRoomSummary)
-                {
-                    [self preloadRoomsSummaries];
                 }
                 if (preloadOptions & MXFileStorePreloadOptionRoomAccountData)
                 {
                     [self preloadRoomsAccountData];
                 }
-                [self loadReceipts];
+                if (preloadOptions & MXFileStorePreloadOptionReadReceipts)
+                {
+                    [self preloadRoomReceipts];
+                }
                 [self loadUsers];
                 [self loadGroups];
 
-                taskProfile.units = self->roomStores.count;
+                taskProfile.units = self.roomSummaryStore.countOfRooms;
                 [MXSDKOptions.sharedInstance.profiler stopMeasuringTaskWithProfile:taskProfile];
-                NSLog(@"[MXFileStore] Data loaded from files in %.0fms", taskProfile.duration * 1000);
+                MXLogDebug(@"[MXFileStore] Data loaded from files in %.0fms", taskProfile.duration * 1000);
             }
 
             // Else, if credentials is valid, create and store it
@@ -292,6 +311,27 @@ static NSUInteger preloadOptions;
     });
 }
 
+- (void)logFiles
+{
+    MXLogDebug(@"[MXFileStore] logFiles: Files in %@:", self->storePath);
+    NSArray *contents = [[NSFileManager defaultManager] subpathsOfDirectoryAtPath:self->storePath error:nil];
+    NSEnumerator *contentsEnumurator = [contents objectEnumerator];
+    
+    NSUInteger fileCount = 0, diskUsage = 0;
+
+    NSString *file;
+    while (file = [contentsEnumurator nextObject])
+    {
+        NSDictionary *fileAttributes = [[NSFileManager defaultManager] attributesOfItemAtPath:[self->storePath stringByAppendingPathComponent:file] error:nil];
+        NSUInteger fileSize = [[fileAttributes objectForKey:NSFileSize] intValue];
+        
+        MXLogDebug(@"[MXFileStore] logFiles:     - %@: %@", file, [NSByteCountFormatter stringFromByteCount:fileSize countStyle:NSByteCountFormatterCountStyleFile]);
+        diskUsage += fileSize;
+        fileCount++;
+    }
+    
+    MXLogDebug(@"[MXFileStore] logFiles:  %@ files: %@", @(fileCount), [NSByteCountFormatter stringFromByteCount:diskUsage countStyle:NSByteCountFormatterCountStyleFile]);
+}
 
 + (void)setPreloadOptions:(MXFileStorePreloadOptions)thePreloadOptions
 {
@@ -341,14 +381,24 @@ static NSUInteger preloadOptions;
     // Remove this room identifier from the other arrays.
     [roomsToCommitForMessages removeObject:roomId];
     [roomsToCommitForState removeObjectForKey:roomId];
-    [roomsToCommitForSummary removeObjectForKey:roomId];
+    [roomSummaryStore removeSummaryOfRoom:roomId];
     [roomsToCommitForAccountData removeObjectForKey:roomId];
     [roomsToCommitForReceipts removeObject:roomId];
 }
 
 - (void)deleteAllData
 {
-    NSLog(@"[MXFileStore] Delete all data");
+    MXLogDebug(@"[MXFileStore] Delete all data");
+    
+    if (self.storeService)
+    {
+        // Clear aggregations to avoid accumulating counts.
+        [self.storeService resetSecondaryStoresWithSender:self];
+    }
+    else
+    {
+        MXLogError(@"[MXFileStore] deleteAllData called without an MXStoreService, aggregations may become out of sync.")
+    }
 
     [super deleteAllData];
 
@@ -357,10 +407,12 @@ static NSUInteger preloadOptions;
     [[NSFileManager defaultManager] removeItemAtPath:storePath error:&error];
 
     // And create folders back
-    [[NSFileManager defaultManager] createDirectoryAtPath:storePath withIntermediateDirectories:YES attributes:nil error:nil];
-    [[NSFileManager defaultManager] createDirectoryAtPath:storeRoomsPath withIntermediateDirectories:YES attributes:nil error:nil];
-    [[NSFileManager defaultManager] createDirectoryAtPath:storeUsersPath withIntermediateDirectories:YES attributes:nil error:nil];
-    [[NSFileManager defaultManager] createDirectoryAtPath:storeGroupsPath withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storePath error:nil];
+    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storeRoomsPath error:nil];
+    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storeUsersPath error:nil];
+    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storeGroupsPath error:nil];
+    
+    [roomSummaryStore removeAllSummaries];
 
     // Reset data
     metaData = nil;
@@ -398,8 +450,21 @@ static NSUInteger preloadOptions;
     }
 }
 
+- (void)storePartialAttributedTextMessageForRoom:(NSString *)roomId partialAttributedTextMessage:(NSAttributedString *)partialAttributedTextMessage
+{
+    [super storePartialAttributedTextMessageForRoom:roomId partialAttributedTextMessage:partialAttributedTextMessage];
+
+    if (NSNotFound == [roomsToCommitForMessages indexOfObject:roomId])
+    {
+        [roomsToCommitForMessages addObject:roomId];
+    }
+}
+
 - (void)storeHasLoadedAllRoomMembersForRoom:(NSString *)roomId andValue:(BOOL)value
 {
+    // XXX: To remove once https://github.com/vector-im/element-ios/issues/3807 is fixed
+    MXLogDebug(@"[MXFileStore] storeHasLoadedAllRoomMembersForRoom: %@ value: %@", roomId, @(value));
+          
     [super storeHasLoadedAllRoomMembersForRoom:roomId andValue:value];
 
     if (NSNotFound == [roomsToCommitForMessages indexOfObject:roomId])
@@ -422,6 +487,48 @@ static NSUInteger preloadOptions;
     }
 }
 
+- (MXCapabilities *)homeserverCapabilities
+{
+    return metaData.homeserverCapabilities;
+}
+
+- (void)storeHomeserverCapabilities:(MXCapabilities *)capabilities
+{
+    if (metaData)
+    {
+        metaData.homeserverCapabilities = capabilities;
+        metaDataHasChanged = YES;
+    }
+}
+
+- (MXMatrixVersions *)supportedMatrixVersions
+{
+    return metaData.supportedMatrixVersions;
+}
+
+- (void)storeSupportedMatrixVersions:(MXMatrixVersions *)supportedMatrixVersions
+{
+    if (metaData)
+    {
+        metaData.supportedMatrixVersions = supportedMatrixVersions;
+        metaDataHasChanged = YES;
+    }
+}
+
+- (NSInteger)maxUploadSize
+{
+    return metaData.maxUploadSize;
+}
+
+- (void)storeMaxUploadSize:(NSInteger)maxUploadSize
+{
+    if (metaData)
+    {
+        metaData.maxUploadSize = maxUploadSize;
+        metaDataHasChanged = YES;
+    }
+}
+
 - (BOOL)isPermanent
 {
     return YES;
@@ -435,11 +542,6 @@ static NSUInteger preloadOptions;
         metaData.eventStreamToken = eventStreamToken;
         metaDataHasChanged = YES;
     }
-}
-
-- (NSArray *)rooms
-{
-    return roomStores.allKeys;
 }
 
 - (void)storeStateForRoom:(NSString*)roomId stateEvents:(NSArray*)stateEvents
@@ -466,7 +568,12 @@ static NSUInteger preloadOptions;
 
     if (!stateEvents)
     {
-        stateEvents =[NSKeyedUnarchiver unarchiveObjectWithFile:[self stateFileForRoom:roomId forBackup:NO]];
+        NSString *file = [self stateFileForRoom:roomId forBackup:NO];
+        stateEvents = [self loadRootObjectWithoutSecureCodingFromFile:file];
+        if (!stateEvents || !stateEvents.count)
+        {
+            MXLogWarning(@"[MXFileStore] stateOfRoom: no state was loaded for room %@", roomId);
+        }
 
         if (NO == [NSThread isMainThread])
         {
@@ -482,36 +589,6 @@ static NSUInteger preloadOptions;
     }
 
     return stateEvents;
-}
-
-- (void)storeSummaryForRoom:(NSString *)roomId summary:(MXRoomSummary *)summary
-{
-    roomsToCommitForSummary[roomId] = summary;
-}
-
-- (MXRoomSummary *)summaryOfRoom:(NSString *)roomId
-{
-    // First, try to get the data from the cache
-    MXRoomSummary *summary = preloadedRoomSummary[roomId];
-
-    if (!summary)
-    {
-        summary =[NSKeyedUnarchiver unarchiveObjectWithFile:[self summaryFileForRoom:roomId forBackup:NO]];
-
-        if (NO == [NSThread isMainThread])
-        {
-            // If this method is called from the `dispatchQueue` thread, it means MXFileStore is preloading
-            // data. So, fill the cache.
-            preloadedRoomSummary[roomId] = summary;
-        }
-    }
-    else
-    {
-        // The cache information is valid only once
-        [preloadedRoomSummary removeObjectForKey:roomId];
-    }
-
-    return summary;
 }
 
 - (void)storeAccountDataForRoom:(NSString *)roomId userData:(MXRoomAccountData *)accountData
@@ -585,12 +662,37 @@ static NSUInteger preloadOptions;
     return metaData.userAccountData;
 }
 
+- (void)setAreAllIdentityServerTermsAgreed:(BOOL)areAllIdentityServerTermsAgreed
+{
+    if (metaData)
+    {
+        metaData.areAllIdentityServerTermsAgreed = areAllIdentityServerTermsAgreed;
+        metaDataHasChanged = YES;
+    }
+}
+
+- (BOOL)areAllIdentityServerTermsAgreed
+{
+    return metaData.areAllIdentityServerTermsAgreed;
+}
+
+- (NSArray<NSString *> *)roomIds
+{
+    NSArray<NSString *> *roomIDs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self->storeRoomsPath error:nil];
+    NSMutableArray<NSString *> *result = [roomIDs mutableCopy];
+    [result removeObjectsInArray:roomsToCommitForDeletion];
+    return result;
+}
+
 #pragma mark - Matrix filters
 - (void)setSyncFilterId:(NSString *)syncFilterId
 {
+    MXLogDebug(@"[MXFileStore] setSyncFilterId: syncFilterId: %@", syncFilterId);
+    
     [super setSyncFilterId:syncFilterId];
     if (metaData)
     {
+        MXLogDebug(@"[MXFileStore] setSyncFilterId: metaData exists");
         metaData.syncFilterId = syncFilterId;
         metaDataHasChanged = YES;
     }
@@ -603,6 +705,8 @@ static NSUInteger preloadOptions;
 
 - (void)storeFilter:(nonnull MXFilterJSONModel*)filter withFilterId:(nonnull NSString*)filterId
 {
+    MXLogDebug(@"[MXFileStore] storeFilter: filter: %@ with id: %@", filter.JSONDictionary, filterId);
+    
     [super storeFilter:filter withFilterId:filterId];
     filtersHasChanged = YES;
 }
@@ -613,6 +717,7 @@ static NSUInteger preloadOptions;
 {
     if (filters)
     {
+        MXLogDebug(@"[MXFileStore] filterWithFilterId: filters: %@", filters);
         [super filterWithFilterId:filterId success:success failure:failure];
     }
     else
@@ -635,6 +740,7 @@ static NSUInteger preloadOptions;
 {
     if (filters)
     {
+        MXLogDebug(@"[MXFileStore] filterIdForFilter: filters: %@", filters);
         [super filterIdForFilter:filter success:success failure:failure];
     }
     else
@@ -651,8 +757,12 @@ static NSUInteger preloadOptions;
     }
 }
 
-
 - (void)commit
+{
+    [self commitWithCompletion:nil];
+}
+
+- (void)commitWithCompletion:(void (^)(void))completion
 {
     // Save data only if metaData exists
     if (metaData)
@@ -661,7 +771,7 @@ static NSUInteger preloadOptions;
         // we are sure that it will be done on the second pass.
         if (pendingCommits >= 2)
         {
-            NSLog(@"[MXFileStore commit] Ignore it. There are already pending commits");
+            MXLogDebug(@"[MXFileStore commit] Ignore it. There are already pending commits");
             return;
         }
 
@@ -674,7 +784,7 @@ static NSUInteger preloadOptions;
         // Create a bg task if none is available
         if (self.commitBackgroundTask.isRunning)
         {
-            NSLog(@"[MXFileStore commit] Background task %@ reused", self.commitBackgroundTask);
+            MXLogDebug(@"[MXFileStore commit] Background task %@ reused", self.commitBackgroundTask);
         }
         else
         {
@@ -685,10 +795,10 @@ static NSUInteger preloadOptions;
             {
                 backgroundTaskStartDate = startDate;
                 
-                self.commitBackgroundTask = [handler startBackgroundTaskWithName:@"[MXStore] commit" expirationHandler:^{
+                self.commitBackgroundTask = [handler startBackgroundTaskWithName:@"[MXFileStore commit]" expirationHandler:^{
                     MXStrongifyAndReturnIfNil(self);
                     
-                    NSLog(@"[MXFileStore commit] Background task %@ is going to expire - ending it. pendingCommits: %tu", self.commitBackgroundTask, self->pendingCommits);
+                    MXLogDebug(@"[MXFileStore commit] Background task %@ is going to expire - ending it. pendingCommits: %tu", self.commitBackgroundTask, self->pendingCommits);
                 }];
             }
         }
@@ -705,7 +815,7 @@ static NSUInteger preloadOptions;
             // Release the background task if there is no more pending commits
             dispatch_async(dispatch_get_main_queue(), ^(void){
 
-                NSLog(@"[MXFileStore commit] lasted %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                MXLogDebug(@"[MXFileStore commit] lasted %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 
                 self->pendingCommits--;
                 
@@ -716,7 +826,12 @@ static NSUInteger preloadOptions;
                 }
                 else if (self.commitBackgroundTask.isRunning)
                 {
-                    NSLog(@"[MXFileStore commit] Background task %@ is kept - running since %.0fms", self.commitBackgroundTask, [[NSDate date] timeIntervalSinceDate:self->backgroundTaskStartDate] * 1000);
+                    MXLogDebug(@"[MXFileStore commit] Background task %@ is kept - running since %.0fms", self.commitBackgroundTask, [[NSDate date] timeIntervalSinceDate:self->backgroundTaskStartDate] * 1000);
+                }
+                
+                if (completion)
+                {
+                    completion();
                 }
             });
         });
@@ -728,8 +843,8 @@ static NSUInteger preloadOptions;
     // Save each component one by one
     [self saveRoomsDeletion];
     [self saveRoomsMessages];
+    [self saveRoomsOutgoingMessages];
     [self saveRoomsState];
-    [self saveRoomsSummaries];
     [self saveRoomsAccountData];
     [self saveReceipts];
     [self saveUsers];
@@ -741,7 +856,7 @@ static NSUInteger preloadOptions;
 
 - (void)close
 {
-    NSLog(@"[MXFileStore] close: %tu pendingCommits", pendingCommits);
+    MXLogDebug(@"[MXFileStore] close: %tu pendingCommits", pendingCommits);
 
     // Flush pending commits
     if (pendingCommits)
@@ -765,16 +880,142 @@ static NSUInteger preloadOptions;
 #pragma mark - Protected operations
 - (MXMemoryRoomStore*)getOrCreateRoomStore:(NSString*)roomId
 {
-    MXFileRoomStore *roomStore = roomStores[roomId];
+    MXFileRoomStore *roomStore = (MXFileRoomStore *)roomStores[roomId];
     if (nil == roomStore)
     {
-        // MXFileStore requires MXFileRoomStore objets
-        roomStore = [[MXFileRoomStore alloc] init];
-        roomStores[roomId] = roomStore;
+        //  This object is global, which means that we will be able to open only one room at a time.
+        //  A per-room lock might be better.
+        @synchronized (roomStores) {
+            NSString *roomFile = [self messagesFileForRoom:roomId forBackup:NO];
+            BOOL isMarkedForDeletion = [roomsToCommitForDeletion containsObject:roomId];
+            if (!isMarkedForDeletion && [[NSFileManager defaultManager] fileExistsAtPath:roomFile])
+            {
+                @try
+                {
+                    NSDate *startDate = [NSDate date];
+                    roomStore = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+                    if ([NSThread isMainThread])
+                    {
+                        MXLogWarning(@"[MXFileStore] Loaded room messages of room: %@ in %.0fms, in main thread", roomId, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                    }
+                    self->roomStores[roomId] = roomStore;
+                }
+                @catch (NSException *exception)
+                {
+                    NSDictionary *logDetails = @{
+                        @"roomId": roomId ?: @"unknown",
+                        @"exception": exception ?: @"unknown"
+                    };
+                    MXLogErrorDetails(@"[MXFileStore] Warning: MXFileRoomStore file for room has been corrupted", logDetails);
+                    [self logFiles];
+                    [self deleteAllData];
+                }
+            }
+            else
+            {
+                // MXFileStore requires MXFileRoomStore objets
+                roomStore = [[MXFileRoomStore alloc] init];
+                self->roomStores[roomId] = roomStore;
+            }
+        }
     }
     return roomStore;
 }
 
+- (MXMemoryRoomOutgoingMessagesStore *)getOrCreateRoomOutgoingMessagesStore:(NSString *)roomId
+{
+    MXMemoryRoomOutgoingMessagesStore *store = roomOutgoingMessagesStores[roomId];
+    if (nil == store)
+    {
+        //  This object is global, which means that we will be able to open only one room at a time.
+        //  A per-room lock might be better.
+        @synchronized (roomOutgoingMessagesStores) {
+            NSString *roomFile = [self outgoingMessagesFileForRoom:roomId forBackup:NO];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:roomFile])
+            {
+                @try
+                {
+                    NSDate *startDate = [NSDate date];
+                    store = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+                    if ([NSThread isMainThread])
+                    {
+                        MXLogWarning(@"[MXFileStore] Loaded outgoing messages of room: %@ in %.0fms, in main thread", roomId, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                    }
+                    self->roomOutgoingMessagesStores[roomId] = store;
+                }
+                @catch (NSException *exception)
+                {
+                    NSDictionary *logDetails = @{
+                        @"roomId": roomId ?: @"unknown",
+                        @"exception": exception ?: @"unknown"
+                    };
+                    MXLogErrorDetails(@"[MXFileStore] Warning: MXFileRoomOutgoingMessagesStore file for room as been corrupted", logDetails);
+                    [self logFiles];
+                    [self deleteAllData];
+                }
+            }
+            else
+            {
+                // MXFileStore requires MXFileRoomOutgoingMessagesStore objets
+                store = [MXFileRoomOutgoingMessagesStore new];
+                self->roomOutgoingMessagesStores[roomId] = store;
+            }
+        }
+    }
+    
+    return store;
+}
+
+- (RoomReceiptsStore*)getOrCreateRoomReceiptsStore:(NSString *)roomId
+{
+    RoomReceiptsStore *receiptsStore = roomReceiptsStores[roomId];
+    if (nil == receiptsStore)
+    {
+        //  This object is global, which means that we will be able to open only one room at a time.
+        //  A per-room lock might be better.
+        @synchronized (roomReceiptsStores) {
+            NSString *roomFile = [self readReceiptsFileForRoom:roomId forBackup:NO];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:roomFile])
+            {
+                @try
+                {
+                    NSDate *startDate = [NSDate date];
+                    receiptsStore = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+                    roomReceiptsStores[roomId] = receiptsStore;
+                    if ([NSThread isMainThread])
+                    {
+                        MXLogWarning(@"[MXFileStore] Loaded read receipts of room: %@ in %.0fms, in main thread", roomId, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                    }
+                }
+                @catch (NSException *exception)
+                {
+                    NSDictionary *logDetails = @{
+                        @"roomId": roomId ?: @"",
+                        @"exception": exception
+                    };
+                    MXLogErrorDetails(@"[MXFileStore] Warning: loadReceipts file for room as been corrupted", logDetails);
+                    
+                    // We used to reset the store and force a full initial sync but this makes the app
+                    // start very slowly.
+                    // So, avoid this reset by considering there is no read receipts for this room which
+                    // is not probably true.
+                    // TODO: Can we live with that?
+                    //[self deleteAllData];
+                    
+                    receiptsStore = [RoomReceiptsStore new];
+                    roomReceiptsStores[roomId] = receiptsStore;
+                }
+            }
+            else
+            {
+                receiptsStore = [RoomReceiptsStore new];
+                roomReceiptsStores[roomId] = receiptsStore;
+            }
+        }
+    }
+    
+    return receiptsStore;
+}
 
 #pragma mark - File paths
 - (void)setUpStoragePaths
@@ -782,12 +1023,16 @@ static NSUInteger preloadOptions;
     // credentials must be set before this method starts execution
     NSParameterAssert(credentials);
     
+    if (storePath)
+    {
+        return;
+    }
+    
     NSString *cachePath = nil;
     
-    NSString *applicationGroupIdentifier = [MXSDKOptions sharedInstance].applicationGroupIdentifier;
-    if (applicationGroupIdentifier)
+    NSURL *sharedContainerURL = [[NSFileManager defaultManager] applicationGroupContainerURL];
+    if (sharedContainerURL)
     {
-        NSURL *sharedContainerURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:applicationGroupIdentifier];
         cachePath = [sharedContainerURL path];
     }
     else
@@ -834,7 +1079,7 @@ static NSUInteger preloadOptions;
     NSString *roomFolder = [self folderForRoom:roomId forBackup:backup];
     if (![NSFileManager.defaultManager fileExistsAtPath:roomFolder])
     {
-        [[NSFileManager defaultManager] createDirectoryAtPath:roomFolder withIntermediateDirectories:YES attributes:nil error:nil];
+        [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:roomFolder error:nil];
     }
 }
 
@@ -843,14 +1088,14 @@ static NSUInteger preloadOptions;
     return [[self folderForRoom:roomId forBackup:backup] stringByAppendingPathComponent:kMXFileStoreRoomMessagesFile];
 }
 
+- (NSString*)outgoingMessagesFileForRoom:(NSString*)roomId forBackup:(BOOL)backup
+{
+    return [[self folderForRoom:roomId forBackup:backup] stringByAppendingPathComponent:kMXFileStoreRoomOutgoingMessagesFile];
+}
+
 - (NSString*)stateFileForRoom:(NSString*)roomId forBackup:(BOOL)backup
 {
     return [[self folderForRoom:roomId forBackup:backup] stringByAppendingPathComponent:kMXFileStoreRoomStateFile];
-}
-
-- (NSString*)summaryFileForRoom:(NSString*)roomId forBackup:(BOOL)backup
-{
-    return [[self folderForRoom:roomId forBackup:backup] stringByAppendingPathComponent:kMXFileStoreRoomSummaryFile];
 }
 
 - (NSString*)accountDataFileForRoom:(NSString*)roomId forBackup:(BOOL)backup
@@ -918,7 +1163,7 @@ static NSUInteger preloadOptions;
             NSString *groupBackupFolder = [[storeBackupPath stringByAppendingPathComponent:backupEventStreamToken] stringByAppendingPathComponent:kMXFileStoreGroupsFolder];
             if (![NSFileManager.defaultManager fileExistsAtPath:groupBackupFolder])
             {
-                [[NSFileManager defaultManager] createDirectoryAtPath:groupBackupFolder withIntermediateDirectories:YES attributes:nil error:nil];
+                [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:groupBackupFolder error:nil];
             }
             
             return [groupBackupFolder stringByAppendingPathComponent:groupId];
@@ -959,7 +1204,7 @@ static NSUInteger preloadOptions;
     // Check whether the previous commit was interrupted or not.
     if ([fileManager fileExistsAtPath:storeBackupPath])
     {
-        NSLog(@"[MXFileStore] Warning: The previous commit was interrupted. Try to repair the store.");
+        MXLogDebug(@"[MXFileStore] Warning: The previous commit was interrupted. Try to repair the store.");
 
         // Get the previous sync token from the folder name
         NSArray *backupFolderContent = [fileManager contentsOfDirectoryAtPath:storeBackupPath error:nil];
@@ -967,7 +1212,7 @@ static NSUInteger preloadOptions;
         {
             NSString *prevSyncToken = backupFolderContent[0];
 
-            NSLog(@"[MXFileStore] Restore data from sync token: %@", prevSyncToken);
+            MXLogDebug(@"[MXFileStore] Restore data from sync token: %@", prevSyncToken);
 
             NSDate *startDate = [NSDate date];
 
@@ -987,7 +1232,7 @@ static NSUInteger preloadOptions;
                                      toPath:[storePath stringByAppendingString:file]
                                       error:&error])
                 {
-                    NSLog(@"MXFileStore] Restore data: ERROR: Cannot copy file: %@", error);
+                    MXLogDebug(@"MXFileStore] Restore data: ERROR: Cannot copy file: %@", error);
 
                     checkStorageValidity = NO;
                     break;
@@ -996,7 +1241,7 @@ static NSUInteger preloadOptions;
 
             if (checkStorageValidity)
             {
-                NSLog(@"[MXFileStore] Restore data: %tu files have been successfully restored in %.0fms", backupFiles.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+                MXLogDebug(@"[MXFileStore] Restore data: %tu files have been successfully restored in %.0fms", backupFiles.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
                 
                 // Load the event stream token.
                 [self loadMetaData];
@@ -1010,13 +1255,14 @@ static NSUInteger preloadOptions;
         }
         else
         {
-            NSLog(@"MXFileStore] Restore data: ERROR: Cannot find the previous sync token: %@", backupFolderContent);
+            MXLogDebug(@"MXFileStore] Restore data: ERROR: Cannot find the previous sync token: %@", backupFolderContent);
             checkStorageValidity = NO;
         }
 
         if (!checkStorageValidity)
         {
-            NSLog(@"[MXFileStore] Restore data: Cannot restore previous data. Reset the store");
+            MXLogDebug(@"[MXFileStore] Restore data: Cannot restore previous data. Reset the store");
+            [self logFiles];
             [self deleteAllData];
         }
     }
@@ -1032,7 +1278,7 @@ static NSUInteger preloadOptions;
 
 #pragma mark - Rooms messages
 // Load the data store in files
-- (void)loadRoomsMessages
+- (void)preloadRoomsMessages
 {
     NSArray<NSString *> *roomIDs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:storeRoomsPath error:nil];
 
@@ -1045,27 +1291,30 @@ static NSUInteger preloadOptions;
         MXFileRoomStore *roomStore;
         @try
         {
-            roomStore =[NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+            roomStore = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
         }
         @catch (NSException *exception)
         {
-            NSLog(@"[MXFileStore] Warning: MXFileRoomStore file for room %@ has been corrupted", roomId);
+            MXLogDebug(@"[MXFileStore] Warning: MXFileRoomStore file for room %@ has been corrupted. Exception: %@", roomId, exception);
         }
 
         if (roomStore)
         {
-            //NSLog(@"   - %@: %@", roomId, roomStore);
+            //MXLogDebug(@"   - %@: %@", roomId, roomStore);
             roomStores[roomId] = roomStore;
         }
         else
         {
-            NSLog(@"[MXFileStore] Warning: MXFileStore has been reset due to room file corruption. Room id: %@", roomId);
+            MXLogDebug(@"[MXFileStore] Warning: MXFileStore has been reset due to room file corruption. Room id: %@. File path: %@",
+                  roomId, roomFile);
+            
+            [self logFiles];
             [self deleteAllData];
             break;
         }
     }
 
-    NSLog(@"[MXFileStore] Loaded room messages of %tu rooms in %.0fms", roomStores.allKeys.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded room messages of %tu rooms in %.0fms", roomStores.allKeys.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (void)saveRoomsMessages
@@ -1076,7 +1325,7 @@ static NSUInteger preloadOptions;
         [roomsToCommitForMessages removeAllObjects];
 
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveRoomsMessages for %tu rooms", roomsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveRoomsMessages for %tu rooms", roomsToCommit.count);
 #endif
 
         MXWeakify(self);
@@ -1089,7 +1338,7 @@ static NSUInteger preloadOptions;
             // Save rooms where there was changes
             for (NSString *roomId in roomsToCommit)
             {
-                MXFileRoomStore *roomStore = self->roomStores[roomId];
+                MXFileRoomStore *roomStore = (MXFileRoomStore *)self->roomStores[roomId];
                 if (roomStore)
                 {
                     NSString *file = [self messagesFileForRoom:roomId forBackup:NO];
@@ -1109,7 +1358,7 @@ static NSUInteger preloadOptions;
             }
 
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
 #endif
         });
     }
@@ -1133,7 +1382,7 @@ static NSUInteger preloadOptions;
         preloadedRoomsStates[roomId] = [self stateOfRoom:roomId];
     }
 
-    NSLog(@"[MXFileStore] Loaded room states of %tu rooms in %.0fms", roomIDs.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded room states of %tu rooms in %.0fms", roomIDs.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (void)saveRoomsState
@@ -1144,7 +1393,7 @@ static NSUInteger preloadOptions;
         NSDictionary *roomsToCommit = [NSDictionary dictionaryWithDictionary:roomsToCommitForState];
         [roomsToCommitForState removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveRoomsState for %tu rooms", roomsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveRoomsState for %tu rooms", roomsToCommit.count);
 #endif
         dispatch_async(dispatchQueue, ^(void){
 #if DEBUG
@@ -1153,6 +1402,8 @@ static NSUInteger preloadOptions;
             for (NSString *roomId in roomsToCommit)
             {
                 NSArray *stateEvents = roomsToCommit[roomId];
+                
+                MXLogDebug(@"[MXFileStore commit] saveRoomsState: saving %lu events for room %@", stateEvents.count, roomId);
 
                 NSString *file = [self stateFileForRoom:roomId forBackup:NO];
                 NSString *backupFile = [self stateFileForRoom:roomId forBackup:YES];
@@ -1166,75 +1417,14 @@ static NSUInteger preloadOptions;
 
                 // Store new data
                 [self checkFolderExistenceForRoom:roomId forBackup:NO];
-                [NSKeyedArchiver archiveRootObject:stateEvents toFile:file];
+                [self saveObject:stateEvents toFile:file];
             }
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for %tu rooms state", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for %tu rooms state", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
 #endif
         });
     }
 }
-
-
-#pragma mark - Rooms summaries
-/**
- Preload summaries of all rooms.
-
- This operation must be called on the `dispatchQueue` thread to avoid blocking the main thread.
- */
-- (void)preloadRoomsSummaries
-{
-    NSArray<NSString *> *roomIDs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:storeRoomsPath error:nil];
-    
-    NSDate *startDate = [NSDate date];
-
-    for (NSString *roomId in roomIDs)
-    {
-        preloadedRoomSummary[roomId] = [self summaryOfRoom:roomId];
-    }
-
-    NSLog(@"[MXFileStore] Loaded rooms summaries data of %tu rooms in %.0fms", roomIDs.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
-}
-
-- (void)saveRoomsSummaries
-{
-    if (roomsToCommitForSummary.count)
-    {
-        // Take a snapshot of room ids to store to process them on the other thread
-        NSDictionary *roomsToCommit = [NSDictionary dictionaryWithDictionary:roomsToCommitForSummary];
-        [roomsToCommitForSummary removeAllObjects];
-#if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveRoomsSummaries for %tu rooms", roomsToCommit.count);
-#endif
-        dispatch_async(dispatchQueue, ^(void){
-#if DEBUG
-            NSDate *startDate = [NSDate date];
-#endif
-            for (NSString *roomId in roomsToCommit)
-            {
-                MXRoomSummary *summary = roomsToCommit[roomId];
-
-                NSString *file = [self summaryFileForRoom:roomId forBackup:NO];
-                NSString *backupFile = [self summaryFileForRoom:roomId forBackup:YES];
-
-                // Backup the file
-                if (backupFile && [[NSFileManager defaultManager] fileExistsAtPath:file])
-                {
-                    [self checkFolderExistenceForRoom:roomId forBackup:YES];
-                    [[NSFileManager defaultManager] moveItemAtPath:file toPath:backupFile error:nil];
-                }
-
-                // Store new data
-                [self checkFolderExistenceForRoom:roomId forBackup:NO];
-                [NSKeyedArchiver archiveRootObject:summary toFile:file];
-            }
-#if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for summaries for %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
-#endif
-        });
-    }
-}
-
 
 #pragma mark - Rooms account data
 /**
@@ -1253,7 +1443,7 @@ static NSUInteger preloadOptions;
         preloadedRoomAccountData[roomId] = [self accountDataOfRoom:roomId];
     }
 
-    NSLog(@"[MXFileStore] Loaded rooms account data of %tu rooms in %.0fms", roomIDs.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded rooms account data of %tu rooms in %.0fms", roomIDs.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (void)saveRoomsAccountData
@@ -1264,7 +1454,7 @@ static NSUInteger preloadOptions;
         NSDictionary *roomsToCommit = [NSDictionary dictionaryWithDictionary:roomsToCommitForAccountData];
         [roomsToCommitForAccountData removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveRoomsAccountData for %tu rooms", roomsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveRoomsAccountData for %tu rooms", roomsToCommit.count);
 #endif
         dispatch_async(dispatchQueue, ^(void){
 #if DEBUG
@@ -1289,7 +1479,7 @@ static NSUInteger preloadOptions;
                 [NSKeyedArchiver archiveRootObject:roomAccountData toFile:file];
             }
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for account data for %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for account data for %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
 #endif
         });
     }
@@ -1304,7 +1494,7 @@ static NSUInteger preloadOptions;
         NSArray *roomsToCommit = [[NSArray alloc] initWithArray:roomsToCommitForDeletion copyItems:YES];
         [roomsToCommitForDeletion removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveRoomsDeletion for %tu rooms", roomsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveRoomsDeletion for %tu rooms", roomsToCommit.count);
 #endif
         dispatch_async(dispatchQueue, ^(void){
             
@@ -1322,7 +1512,7 @@ static NSUInteger preloadOptions;
                     // Make sure the backup folder exists
                     if (![NSFileManager.defaultManager fileExistsAtPath:self.storeBackupRoomsPath])
                     {
-                        [[NSFileManager defaultManager] createDirectoryAtPath:self.storeBackupRoomsPath withIntermediateDirectories:YES attributes:nil error:nil];
+                        [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:self.storeBackupRoomsPath error:nil];
                     }
 
                     // Remove the room folder by trashing it into the backup folder
@@ -1331,7 +1521,7 @@ static NSUInteger preloadOptions;
 
             }
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for %tu rooms deletion", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for %tu rooms deletion", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
 #endif
         });
     }
@@ -1343,9 +1533,9 @@ static NSUInteger preloadOptions;
 {
     [super storeOutgoingMessageForRoom:roomId outgoingMessage:outgoingMessage];
 
-    if (NSNotFound == [roomsToCommitForMessages indexOfObject:roomId])
+    if (NSNotFound == [roomsToCommitForOutgoingMessages indexOfObject:roomId])
     {
-        [roomsToCommitForMessages addObject:roomId];
+        [roomsToCommitForOutgoingMessages addObject:roomId];
     }
 }
 
@@ -1353,9 +1543,9 @@ static NSUInteger preloadOptions;
 {
     [super removeAllOutgoingMessagesFromRoom:roomId];
 
-    if (NSNotFound == [roomsToCommitForMessages indexOfObject:roomId])
+    if (NSNotFound == [roomsToCommitForOutgoingMessages indexOfObject:roomId])
     {
-        [roomsToCommitForMessages addObject:roomId];
+        [roomsToCommitForOutgoingMessages addObject:roomId];
     }
 }
 
@@ -1363,30 +1553,83 @@ static NSUInteger preloadOptions;
 {
     [super removeOutgoingMessageFromRoom:roomId outgoingMessage:outgoingMessageEventId];
 
-    if (NSNotFound == [roomsToCommitForMessages indexOfObject:roomId])
+    if (NSNotFound == [roomsToCommitForOutgoingMessages indexOfObject:roomId])
     {
-        [roomsToCommitForMessages addObject:roomId];
+        [roomsToCommitForOutgoingMessages addObject:roomId];
     }
 }
 
+- (void)saveRoomsOutgoingMessages
+{
+    if (roomsToCommitForOutgoingMessages.count)
+    {
+        NSArray *roomsToCommit = [[NSArray alloc] initWithArray:roomsToCommitForOutgoingMessages copyItems:YES];
+        [roomsToCommitForOutgoingMessages removeAllObjects];
+
+#if DEBUG
+        MXLogDebug(@"[MXFileStore commit] queuing saveRoomsOutgoingMessages for %tu rooms", roomsToCommit.count);
+#endif
+
+        MXWeakify(self);
+        dispatch_async(dispatchQueue, ^(void){
+            MXStrongifyAndReturnIfNil(self);
+
+#if DEBUG
+            NSDate *startDate = [NSDate date];
+#endif
+            // Save rooms where there was changes
+            for (NSString *roomId in roomsToCommit)
+            {
+                MXFileRoomOutgoingMessagesStore *roomStore = (MXFileRoomOutgoingMessagesStore *)self->roomOutgoingMessagesStores[roomId];
+                if (roomStore)
+                {
+                    NSString *file = [self outgoingMessagesFileForRoom:roomId forBackup:NO];
+                    NSString *backupFile = [self outgoingMessagesFileForRoom:roomId forBackup:YES];
+
+                    // Backup the file
+                    if (backupFile && [[NSFileManager defaultManager] fileExistsAtPath:file])
+                    {
+                        [self checkFolderExistenceForRoom:roomId forBackup:YES];
+                        [[NSFileManager defaultManager] moveItemAtPath:file toPath:backupFile error:nil];
+                    }
+
+                    // Store new data
+                    [self checkFolderExistenceForRoom:roomId forBackup:NO];
+                    [NSKeyedArchiver archiveRootObject:roomStore toFile:file];
+                }
+            }
+
+#if DEBUG
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for %tu rooms outgoing messages", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+#endif
+        });
+    }
+}
 
 #pragma mark - MXFileStore metadata
 - (void)loadMetaData
 {
+    [self loadMetaData:YES];
+}
+
+- (void)loadMetaData:(BOOL)enableClearData
+{
+    MXLogDebug(@"[MXFileStore] loadMetaData: enableClearData: %@", enableClearData ? @"YES" : @"NO");
+
     NSString *metaDataFile = [storePath stringByAppendingPathComponent:kMXFileStoreMedaDataFile];
     
     @try
     {
-        metaData = [NSKeyedUnarchiver unarchiveObjectWithFile:metaDataFile];
+        metaData = [self loadRootObjectWithoutSecureCodingFromFile:metaDataFile];
     }
     @catch (NSException *exception)
     {
-        NSLog(@"[MXFileStore] loadMetaData: Warning: MXFileStore metadata has been corrupted");
+        MXLogDebug(@"[MXFileStore] loadMetaData: Warning: MXFileStore metadata has been corrupted");
     }
     
     if (metaData && ![metaData isKindOfClass:MXFileStoreMetaData.class])
     {
-        NSLog(@"[MXFileStore] loadMetaData: Warning: Bad MXFileStore metadata type: %@", metaData);
+        MXLogDebug(@"[MXFileStore] loadMetaData: Warning: Bad MXFileStore metadata type: %@", metaData);
         metaData = nil;
     }
     
@@ -1397,8 +1640,12 @@ static NSUInteger preloadOptions;
     }
     else
     {
-        NSLog(@"[MXFileStore] loadMetaData: event stream token is missing");
-        [self deleteAllData];
+        MXLogDebug(@"[MXFileStore] loadMetaData: event stream token is missing");
+        [self logFiles];
+        if (enableClearData)
+        {
+            [self deleteAllData];
+        }
     }
 }
 
@@ -1410,7 +1657,7 @@ static NSUInteger preloadOptions;
         metaDataHasChanged = NO;
 
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveMetaData");
+        MXLogDebug(@"[MXFileStore commit] queuing saveMetaData");
 #endif
 
         MXWeakify(self);
@@ -1430,7 +1677,7 @@ static NSUInteger preloadOptions;
                 NSString *storeBackupMetaDataPath = [self->storeBackupPath stringByAppendingPathComponent:self->backupEventStreamToken];
                 if (![NSFileManager.defaultManager fileExistsAtPath:storeBackupMetaDataPath])
                 {
-                    [[NSFileManager defaultManager] createDirectoryAtPath:storeBackupMetaDataPath withIntermediateDirectories:YES attributes:nil error:nil];
+                    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storeBackupMetaDataPath error:nil];
                 }
                 
                 [[NSFileManager defaultManager] moveItemAtPath:file toPath:backupFile error:nil];
@@ -1440,10 +1687,10 @@ static NSUInteger preloadOptions;
             self->backupEventStreamToken = self->metaData.eventStreamToken;
 
             // Store new data
-            [NSKeyedArchiver archiveRootObject:self->metaData toFile:file];
+            [self saveObject:self->metaData toFile:file];
 
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for metadata", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for metadata", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 #endif
         });
     }
@@ -1452,13 +1699,15 @@ static NSUInteger preloadOptions;
 #pragma mark - Matrix filters
 - (void)loadFilters
 {
+    MXLogDebug(@"[MXFileStore] Loading filters");
     NSString *file = [storePath stringByAppendingPathComponent:kMXFileStoreFiltersFile];
-    filters = [NSKeyedUnarchiver unarchiveObjectWithFile:file];
+    filters = [self loadObjectOfClasses:[NSSet setWithArray:@[NSDictionary.class, NSString.class]] fromFile:file];
 
     if (!filters)
     {
         // This is used as flag to indicate it has been mounted from the file
         filters = [NSMutableDictionary dictionary];
+        MXLogDebug(@"[MXFileStore] No filters loaded, creating empty dictionary");
     }
 }
 
@@ -1483,14 +1732,15 @@ static NSUInteger preloadOptions;
                 NSString *storeBackupMetaDataPath = [self->storeBackupPath stringByAppendingPathComponent:self->backupEventStreamToken];
                 if (![NSFileManager.defaultManager fileExistsAtPath:storeBackupMetaDataPath])
                 {
-                    [[NSFileManager defaultManager] createDirectoryAtPath:storeBackupMetaDataPath withIntermediateDirectories:YES attributes:nil error:nil];
+                    [[NSFileManager defaultManager] createDirectoryExcludedFromBackupAtPath:storeBackupMetaDataPath error:nil];
                 }
 
                 [[NSFileManager defaultManager] moveItemAtPath:file toPath:backupFile error:nil];
             }
 
             // Store new data
-            [NSKeyedArchiver archiveRootObject:self->filters toFile:file];
+            MXLogDebug(@"[MXFileStore] Saving filters");
+            [self saveObject:self->filters toFile:file];
         });
     }
 }
@@ -1524,11 +1774,11 @@ static NSUInteger preloadOptions;
         }
         @catch (NSException *exception)
         {
-            NSLog(@"[MXFileStore] Warning: MXFileRoomStore file for users group %@ has been corrupted", group);
+            MXLogDebug(@"[MXFileStore] Warning: MXFileRoomStore file for users group %@ has been corrupted", group);
         }
     }
     
-    NSLog(@"[MXFileStore] Loaded %tu MXUsers in %.0fms", users.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded %tu MXUsers in %.0fms", users.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (NSArray<MXUser *> *)loadUsersWithUserIds:(NSArray<NSString *> *)userIds
@@ -1571,7 +1821,7 @@ static NSUInteger preloadOptions;
             }
             @catch (NSException *exception)
             {
-                NSLog(@"[MXFileStore] Warning: MXFileRoomStore file for users group %@ has been corrupted", group);
+                MXLogDebug(@"[MXFileStore] Warning: MXFileRoomStore file for users group %@ has been corrupted", group);
             }
         }
     }
@@ -1588,7 +1838,7 @@ static NSUInteger preloadOptions;
         NSMutableDictionary *theUsersToCommit = [[NSMutableDictionary alloc] initWithDictionary:usersToCommit copyItems:YES];
         [usersToCommit removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveUsers");
+        MXLogDebug(@"[MXFileStore commit] queuing saveUsers");
 #endif
         dispatch_async(dispatchQueue, ^(void){
 
@@ -1652,7 +1902,7 @@ static NSUInteger preloadOptions;
             }
 
 #if DEBUG
-            NSLog(@"[MXFileStore] saveUsers in %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+            MXLogDebug(@"[MXFileStore] saveUsers in %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 #endif
         });
     }
@@ -1686,11 +1936,11 @@ static NSUInteger preloadOptions;
         }
         @catch (NSException *exception)
         {
-            NSLog(@"[MXFileStore] Warning: File for group %@ has been corrupted", groupId);
+            MXLogDebug(@"[MXFileStore] Warning: File for group %@ has been corrupted", groupId);
         }
     }
     
-    NSLog(@"[MXFileStore] Loaded %tu MXGroups in %.0fms", groups.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded %tu MXGroups in %.0fms", groups.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (void)saveGroupsDeletion
@@ -1700,7 +1950,7 @@ static NSUInteger preloadOptions;
         NSArray *groupsToCommit = [[NSArray alloc] initWithArray:groupsToCommitForDeletion copyItems:YES];
         [groupsToCommitForDeletion removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveGroupsDeletion for %tu rooms", groupsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveGroupsDeletion for %tu rooms", groupsToCommit.count);
 #endif
         dispatch_async(dispatchQueue, ^(void){
             
@@ -1719,7 +1969,7 @@ static NSUInteger preloadOptions;
                 }
             }
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for %tu groups deletion", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, groupsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for %tu groups deletion", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, groupsToCommit.count);
 #endif
         });
     }
@@ -1734,7 +1984,7 @@ static NSUInteger preloadOptions;
         NSMutableDictionary *theGroupsToCommit = [[NSMutableDictionary alloc] initWithDictionary:groupsToCommit copyItems:YES];
         [groupsToCommit removeAllObjects];
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveGroups");
+        MXLogDebug(@"[MXFileStore commit] queuing saveGroups");
 #endif
         dispatch_async(dispatchQueue, ^(void){
             
@@ -1758,13 +2008,27 @@ static NSUInteger preloadOptions;
                 [NSKeyedArchiver archiveRootObject:group toFile:file];
             }
 #if DEBUG
-            NSLog(@"[MXFileStore] saveGroups in %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+            MXLogDebug(@"[MXFileStore] saveGroups in %.0fms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 #endif
         });
     }
 }
 
 #pragma mark - Room receipts
+
+- (void)loadReceiptsForRoom:(NSString *)roomId completion:(void (^)(void))completion
+{
+    dispatch_async(dispatchQueue, ^{
+        [self getOrCreateRoomReceiptsStore:roomId];
+        
+        if (completion)
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion();
+            });
+        }
+    });
+}
 
 /**
  * Store the receipt for an user in a room
@@ -1787,7 +2051,7 @@ static NSUInteger preloadOptions;
 
 
 // Load the data store in files
-- (void)loadReceipts
+- (void)preloadRoomReceipts
 {
     NSArray<NSString *> *roomIDs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:storeRoomsPath error:nil];
     
@@ -1797,24 +2061,24 @@ static NSUInteger preloadOptions;
     {
         NSString *roomFile = [self readReceiptsFileForRoom:roomId forBackup:NO];
 
-        NSMutableDictionary *receiptsDict;
+        RoomReceiptsStore *receiptsStore;
         @try
         {
-            receiptsDict =[NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+            receiptsStore = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
         }
         @catch (NSException *exception)
         {
-            NSLog(@"[MXFileStore] Warning: loadReceipts file for room %@ has been corrupted", roomId);
+            MXLogDebug(@"[MXFileStore] Warning: loadReceipts file for room %@ has been corrupted", roomId);
         }
 
-        if (receiptsDict)
+        if (receiptsStore)
         {
-            //NSLog(@"   - %@: %tu", roomId, receiptsDict.count);
-            receiptsByRoomId[roomId] = receiptsDict;
+            //MXLogDebug(@"   - %@: %tu", roomId, receiptsDict.count);
+            roomReceiptsStores[roomId] = receiptsStore;
         }
         else
         {
-            NSLog(@"[MXFileStore] Warning: MXFileStore has no receipts file for room %@", roomId);
+            MXLogDebug(@"[MXFileStore] Warning: MXFileStore has no receipts file for room %@", roomId);
 
             // We used to reset the store and force a full initial sync but this makes the app
             // start very slowly.
@@ -1823,11 +2087,11 @@ static NSUInteger preloadOptions;
             // TODO: Can we live with that?
             //[self deleteAllData];
 
-            receiptsByRoomId[roomId] = [NSMutableDictionary dictionary];
+            roomReceiptsStores[roomId] = [RoomReceiptsStore new];
         }
     }
 
-    NSLog(@"[MXFileStore] Loaded read receipts of %tu rooms in %.0fms", receiptsByRoomId.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
+    MXLogDebug(@"[MXFileStore] Loaded read receipts of %tu rooms in %.0fms", roomReceiptsStores.count, [[NSDate date] timeIntervalSinceDate:startDate] * 1000);
 }
 
 - (void)saveReceipts
@@ -1838,7 +2102,7 @@ static NSUInteger preloadOptions;
         [roomsToCommitForReceipts removeAllObjects];
 
 #if DEBUG
-        NSLog(@"[MXFileStore commit] queuing saveReceipts for %tu rooms", roomsToCommit.count);
+        MXLogDebug(@"[MXFileStore commit] queuing saveReceipts for %tu rooms", roomsToCommit.count);
 #endif
         MXWeakify(self);
         dispatch_async(dispatchQueue, ^(void){
@@ -1850,10 +2114,10 @@ static NSUInteger preloadOptions;
             // Save rooms where there was changes
             for (NSString *roomId in roomsToCommit)
             {
-                NSMutableDictionary* receiptsByUserId = self->receiptsByRoomId[roomId];
-                if (receiptsByUserId)
+                RoomReceiptsStore *receiptsStore = self->roomReceiptsStores[roomId];
+                if (receiptsStore)
                 {
-                    @synchronized (receiptsByUserId)
+                    @synchronized (receiptsStore)
                     {
                         NSString *file = [self readReceiptsFileForRoom:roomId forBackup:NO];
                         NSString *backupFile = [self readReceiptsFileForRoom:roomId forBackup:YES];
@@ -1867,13 +2131,13 @@ static NSUInteger preloadOptions;
 
                         // Store new data
                         [self checkFolderExistenceForRoom:roomId forBackup:NO];
-                        [NSKeyedArchiver archiveRootObject:receiptsByUserId toFile:file];
+                        [NSKeyedArchiver archiveRootObject:receiptsStore toFile:file];
                     }
                 }
             }
             
 #if DEBUG
-            NSLog(@"[MXFileStore commit] lasted %.0fms for receipts in %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
+            MXLogDebug(@"[MXFileStore commit] lasted %.0fms for receipts in %tu rooms", [[NSDate date] timeIntervalSinceDate:startDate] * 1000, roomsToCommit.count);
 #endif
         });
     }
@@ -1923,22 +2187,6 @@ static NSUInteger preloadOptions;
     });
 }
 
-- (void)asyncRoomsSummaries:(void (^)(NSArray<MXRoomSummary *> * _Nonnull))success failure:(nullable void (^)(NSError * _Nonnull))failure
-{
-    MXWeakify(self);
-    dispatch_async(dispatchQueue, ^{
-        MXStrongifyAndReturnIfNil(self);
-
-        [self preloadRoomsSummaries];
-
-        MXWeakify(self);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MXStrongifyAndReturnIfNil(self);
-            success(self->preloadedRoomSummary.allValues);
-        });
-    });
-}
-
 - (void)asyncAccountDataOfRoom:(NSString *)roomId success:(void (^)(MXRoomAccountData * _Nonnull))success failure:(nullable void (^)(NSError * _Nonnull))failure
 {
     dispatch_async(dispatchQueue, ^{
@@ -1951,7 +2199,141 @@ static NSUInteger preloadOptions;
     });
 }
 
+
+#pragma mark - Sync API (Do not use them on the main thread)
+
+- (MXFileRoomStore *)roomStoreForRoom:(NSString*)roomId
+{
+    NSString *roomFile = [self messagesFileForRoom:roomId forBackup:NO];
+    
+    MXFileRoomStore *roomStore;
+    @try
+    {
+        roomStore = [NSKeyedUnarchiver unarchiveObjectWithFile:roomFile];
+    }
+    @catch (NSException *exception)
+    {
+        MXLogDebug(@"[MXFileStore] roomStoreForRoom = Warning: MXFileRoomStore file for room %@ seems corrupted", roomId);
+    }
+    
+    return roomStore;
+}
+
+
 #pragma mark - Tools
+
+/**
+ Save an object to file using a newer `NSKeyedArchiver` API if available, and log any potential errors
+ */
+- (void)saveObject:(id)object toFile:(NSString *)file
+{
+    if (@available(iOS 11.0, *))
+    {
+        NSError *error;
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:object requiringSecureCoding:NO error:&error];
+        if (error)
+        {
+            MXLogFailureDetails(@"[MXFileStore] Failed archiving root object", error);
+            return;
+        }
+        
+        BOOL success = [data writeToFile:file options:0 error:&error];
+        if (success)
+        {
+            MXLogDebug(@"[MXFileStore] Saved data successfully");
+        }
+        else
+        {
+            MXLogFailureDetails(@"[MXFileStore] Failed saving data", error);
+        }
+    }
+    else
+    {
+        [NSKeyedArchiver archiveRootObject:object toFile:file];
+    }
+}
+
+/**
+ Load an object from file using a newer `NSKeyedUnarchiver` API if available, and log any potential errors
+ 
+ @discussion
+ Newer `NSKeyedUnarchiver` API sets `requiresSecureCoding` to `YES` by default, meaning that the caller
+ needs to provide a set of classes expected to be decoded. All of these classes must implement `NSSecureCoding`.
+ */
+- (id)loadObjectOfClasses:(NSSet<Class> *)classes fromFile:(NSString *)file
+{
+    if (@available(iOS 11.0, *))
+    {
+        NSError *error;
+        NSData *data = [NSData dataWithContentsOfFile:file];
+        if (!data)
+        {
+            MXLogDebug(@"[MXFileStore] No data to load at file %@", file);
+            return nil;
+        }
+        
+        id object = [NSKeyedUnarchiver unarchivedObjectOfClasses:classes fromData:data error:&error];
+        if (object && !error)
+        {
+            return object;
+        }
+        else
+        {
+            MXLogFailureDetails(@"[MXFileStore] Failed loading object from class", error);
+            return nil;
+        }
+    }
+    else
+    {
+        return [NSKeyedUnarchiver unarchiveObjectWithFile:file];
+    }
+}
+
+/**
+ Load an object from file using a newer `NSKeyedUnarchiver` API if available, and log any potential errors
+ 
+ @discussion
+ An equivalent of `loadObjectOfClasses` but setting `requiresSecureCoding` to NO. Because of this the caller
+ does not have to specify classes to be decoded, and can archive / unarchive classes that do not implement
+ `NSSecureCoding` protocol.
+ */
+- (id)loadRootObjectWithoutSecureCodingFromFile:(NSString *)file
+{
+    if (@available(iOS 11.0, *))
+    {
+        NSError *error;
+        NSData *data = [NSData dataWithContentsOfFile:file];
+        if (!data)
+        {
+            MXLogDebug(@"[MXFileStore] No data to load at file %@", file);
+            return nil;
+        }
+        NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:&error];
+        if (error && !unarchiver)
+        {
+            MXLogFailureDetails(@"[MXFileStore] Cannot create unarchiver", error);
+            return nil;
+        }
+        unarchiver.requiresSecureCoding = NO;
+        
+        // Seems to be an implementation detaul
+        id object = [unarchiver decodeTopLevelObjectForKey:NSKeyedArchiveRootObjectKey error:&error];
+        if (object && !error)
+        {
+            return object;
+        }
+        else
+        {
+            MXLogFailureDetails(@"[MXFileStore] Failed loading object from class", error);
+            return nil;
+        }
+    }
+    else
+    {
+        return [NSKeyedUnarchiver unarchiveObjectWithFile:file];
+    }
+}
+
 /**
  List recursevely files in a folder
  
@@ -1988,6 +2370,22 @@ static NSUInteger preloadOptions;
     }
     
     return files;
+}
+
+#pragma mark - Room Messages
+
+- (void)loadRoomMessagesForRoom:(NSString *)roomId completion:(void (^)(void))completion
+{
+    dispatch_async(dispatchQueue, ^{
+        [self getOrCreateRoomStore:roomId];
+        
+        if (completion)
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion();
+            });
+        }
+    });
 }
 
 @end

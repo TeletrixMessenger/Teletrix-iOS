@@ -20,7 +20,7 @@
 
 #ifdef MX_CRYPTO
 
-#import <OLMKit/OLMKit.h>
+@class OLMInboundGroupSession;
 
 #import "MXMegolmSessionData.h"
 
@@ -65,6 +65,19 @@
  Other keys the sender claims.
  */
 @property (nonatomic) NSDictionary<NSString*, NSString*> *keysClaimed;
+
+/**
+ Flag indicating whether the history of this room is considered as shared.
+ 
+ This is typically the case if room's `historyVisibility` is set to `world_readable` or `shared`.
+ In this case the keys are allowed to be shared with other users upon invite.
+ */
+@property (nonatomic) BOOL sharedHistory;
+
+/**
+ Flag indicating this session is untrusted or not.
+ */
+@property (nonatomic, getter=isUntrusted) BOOL untrusted;
 
 
 #pragma mark - import/export

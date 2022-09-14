@@ -20,17 +20,28 @@
 
 #import "MXCrypto_Private.h"
 
+#warning File has not been annotated with nullability, see MX_ASSUME_MISSING_NULLABILITY_BEGIN
 
 #pragma mark - Constants
 NSString * const MXKeyVerificationRequestDidChangeNotification = @"MXKeyVerificationRequestDidChangeNotification";
 
-@interface MXKeyVerificationRequest()
+@interface MXDefaultKeyVerificationRequest()
 
 @property (nonatomic, readwrite) MXKeyVerificationRequestState state;
 
 @end
 
-@implementation MXKeyVerificationRequest
+@implementation MXDefaultKeyVerificationRequest
+
+@synthesize event = _event;
+@synthesize fromDevice = _fromDevice;
+@synthesize methods = _methods;
+@synthesize otherDevice = _otherDevice;
+@synthesize otherUser = _otherUser;
+@synthesize reasonCancelCode = _reasonCancelCode;
+@synthesize requestId = _requestId;
+@synthesize timestamp = _timestamp;
+@synthesize transport = _transport;
 
 #pragma mark - SDK-Private methods -
 
@@ -100,12 +111,12 @@ NSString * const MXKeyVerificationRequestDidChangeNotification = @"MXKeyVerifica
                     });
                 } failure:^(NSError * _Nonnull error) {
                     
-                    NSLog(@"[MXKeyVerificationRequest] acceptWithMethods fail to create qrCodeData.");
+                    MXLogDebug(@"[MXKeyVerificationRequest] acceptWithMethods fail to create qrCodeData.");
                     
                     [self cancelWithCancelCode:MXTransactionCancelCode.unexpectedMessage success:^{
                         
                     } failure:^(NSError * _Nonnull error) {
-                        NSLog(@"[MXKeyVerificationRequest] acceptWithMethods fail to cancel request");
+                        MXLogDebug(@"[MXKeyVerificationRequest] acceptWithMethods fail to cancel request");
                     }];
                     
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -189,7 +200,7 @@ NSString * const MXKeyVerificationRequestDidChangeNotification = @"MXKeyVerifica
             [self cancelWithCancelCode:MXTransactionCancelCode.unexpectedMessage success:^{
                 
             } failure:^(NSError * _Nonnull error) {
-                NSLog(@"[MXKeyVerificationRequest] handleReady fail to cancel request");
+                MXLogDebug(@"[MXKeyVerificationRequest] handleReady fail to cancel request");
             }];
         }];
     }
@@ -197,6 +208,11 @@ NSString * const MXKeyVerificationRequestDidChangeNotification = @"MXKeyVerifica
     {
         [self updateState:MXKeyVerificationRequestStateReady notifiy:YES];
     }
+    [self.manager notifyOthersOfAcceptanceWithTransactionId:self.requestId acceptedUserId:self.otherUser acceptedDeviceId: self.otherDevice success:^{
+        MXLogDebug(@"[MXKeyVerificationRequest] handleReady notified others of acceptance");
+    } failure:^(NSError * _Nonnull error) {
+        MXLogError(@"[MXKeyVerificationRequest] handleReady failed notify others of acceptance");
+    }];
 }
 
 - (void)handleCancel:(MXKeyVerificationCancel *)cancelContent

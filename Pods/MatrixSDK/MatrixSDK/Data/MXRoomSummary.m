@@ -27,6 +27,9 @@
 #import "MXEventRelations.h"
 #import "MXEventReplace.h"
 
+#import "MXRoomSync.h"
+#import "MatrixSDKSwiftHeader.h"
+
 #import <Security/Security.h>
 #import <CommonCrypto/CommonCryptor.h>
 
@@ -41,6 +44,7 @@ typedef NS_ENUM(NSUInteger, MXRoomSummaryNextTrustComputation) {
 
 
 NSString *const kMXRoomSummaryDidChangeNotification = @"kMXRoomSummaryDidChangeNotification";
+NSUInteger const MXRoomSummaryPaginationChunkSize = 50;
 
 /**
  Time to wait before refreshing trust when a change has been detected.
@@ -50,9 +54,6 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 
 @interface MXRoomSummary ()
 {
-    // Cache for the last event to avoid to read it from the store everytime
-    MXEvent *lastMessageEvent;
-
     // Flag to avoid to notify several updates
     BOOL updatedWithStateEvents;
 
@@ -65,9 +66,15 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     MXRoomSummaryNextTrustComputation nextTrustComputation;
 }
 
+@property (nonatomic, readwrite) MXSpaceChildInfo *spaceChildInfo;
+
 @end
 
 @implementation MXRoomSummary
+
+@synthesize hasAnyUnread = _hasAnyUnread;
+@synthesize hasAnyNotification = _hasAnyNotification;
+@synthesize hasAnyHighlight = _hasAnyHighlight;
 
 - (instancetype)init
 {
@@ -92,20 +99,61 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     if (self)
     {
         _roomId = roomId;
-        _lastMessageOthers = [NSMutableDictionary dictionary];
         _others = [NSMutableDictionary dictionary];
         store = theStore;
 
         [self setMatrixSession:mxSession];
+        [self commonInit];
     }
 
     return self;
 }
 
+- (instancetype)initWithSummaryModel:(id<MXRoomSummaryProtocol>)model
+{
+    if (self = [super init])
+    {
+        _roomId = model.roomId;
+        [self updateWith:model];
+        [self commonInit];
+    }
+    return self;
+}
+
+- (instancetype)initWithSpaceChildInfo:(MXSpaceChildInfo *)spaceChildInfo
+{
+    if (self = [super init])
+    {
+        _roomId = spaceChildInfo.childRoomId;
+        _spaceChildInfo = spaceChildInfo;
+        [self commonInit];
+    }
+    return self;
+}
+
+- (void)commonInit
+{
+    // Listen to the event sent state changes
+    // This is used to follow evolution of local echo events
+    // (ex: when a sentState change from sending to sentFailed)
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(eventDidChangeSentState:) name:kMXEventDidChangeSentStateNotification object:nil];
+
+    // Listen to the event id change
+    // This is used to follow evolution of local echo events
+    // when they changed their local event id to the final event id
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(eventDidChangeIdentifier:) name:kMXEventDidChangeIdentifierNotification object:nil];
+
+    // Listen to data being flush in a room
+    // This is used to update the room summary in case of a state event redaction
+    // We may need to update the room displayname when it happens
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(roomDidFlushData:) name:kMXRoomDidFlushDataNotification object:nil];
+
+    // Listen to event edits within the room
+    [self registerEventEditsListener];
+}
+
 - (void)destroy
 {
-    NSLog(@"[MXKRoomSummary] Destroy %p - room id: %@", self, _roomId);
-
     [[NSNotificationCenter defaultCenter] removeObserver:self name:kMXEventDidChangeSentStateNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:kMXEventDidChangeIdentifierNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:kMXRoomDidFlushDataNotification object:nil];
@@ -118,33 +166,18 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     {
         _mxSession = mxSession;
         store = mxSession.store;
-
-        // Listen to the event sent state changes
-        // This is used to follow evolution of local echo events
-        // (ex: when a sentState change from sending to sentFailed)
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(eventDidChangeSentState:) name:kMXEventDidChangeSentStateNotification object:nil];
-
-        // Listen to the event id change
-        // This is used to follow evolution of local echo events
-        // when they changed their local event id to the final event id
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(eventDidChangeIdentifier:) name:kMXEventDidChangeIdentifierNotification object:nil];
-
-        // Listen to data being flush in a room
-        // This is used to update the room summary in case of a state event redaction
-        // We may need to update the room displayname when it happens
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(roomDidFlushData:) name:kMXRoomDidFlushDataNotification object:nil];
-
-        // Listen to event edits within the room
-        [self registerEventEditsListener];
     }
- }
+}
 
 - (void)save:(BOOL)commit
 {
-    if ([store respondsToSelector:@selector(storeSummaryForRoom:summary:)])
-    {
-        [store storeSummaryForRoom:_roomId summary:self];
-    }
+    _dataTypes = self.calculateDataTypes;
+    _sentStatus = self.calculateSentStatus;
+    _favoriteTagOrder = self.room.accountData.tags[kMXRoomTagFavourite].order;
+    _storedHash = self.hash;
+    
+    [store.roomSummaryStore storeSummary:self];
+    
     if (commit && [store respondsToSelector:@selector(commit)])
     {
         [store commit];
@@ -169,6 +202,61 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         MXMembershipTransitionState membershipTransitionState = [MXRoomSummary membershipTransitionStateForMembership:membership];
         
         [self updateMemberhsipTransitionState:membershipTransitionState notifyUpdate:NO];
+    }
+}
+
+- (void)setParentSpaceIds:(NSSet<NSString *> *)parentSpaceIds
+{
+    if (![_parentSpaceIds isEqualToSet:parentSpaceIds])
+    {
+        _parentSpaceIds = parentSpaceIds;
+        
+        [self save:YES];
+    }
+}
+
+- (void)updateWith:(id<MXRoomSummaryProtocol>)summary
+{
+    if (!summary)
+    {
+        return;
+    }
+    
+    _roomTypeString = summary.roomTypeString;
+    _roomType = summary.roomType;
+    _avatar = summary.avatar;
+    _displayname = summary.displayname;
+    _topic = summary.topic;
+    _creatorUserId = summary.creatorUserId;
+    _aliases = summary.aliases;
+    _historyVisibility = summary.historyVisibility;
+    _joinRule = summary.joinRule;
+    _membership = summary.membership;
+    _membershipTransitionState = summary.membershipTransitionState;
+    _membersCount = summary.membersCount;
+    _isConferenceUserRoom = summary.isConferenceUserRoom;
+    _hiddenFromUser = summary.hiddenFromUser;
+    _storedHash = summary.storedHash;
+    _lastMessage = summary.lastMessage;
+    _isEncrypted = summary.isEncrypted;
+    _trust = summary.trust;
+    _localUnreadEventCount = summary.localUnreadEventCount;
+    _notificationCount = summary.notificationCount;
+    _highlightCount = summary.highlightCount;
+    _hasAnyUnread = summary.hasAnyUnread;
+    _hasAnyNotification = summary.hasAnyNotification;
+    _hasAnyHighlight = summary.hasAnyHighlight;
+    _directUserId = summary.directUserId;
+    _others = [summary.others mutableCopy];
+    _favoriteTagOrder = summary.favoriteTagOrder;
+    _dataTypes = summary.dataTypes;
+    _sentStatus = summary.sentStatus;
+    _parentSpaceIds = summary.parentSpaceIds;
+    _userIdsSharingLiveBeacon = summary.userIdsSharingLiveBeacon;
+    
+    if (!_others)
+    {
+        _others = [NSMutableDictionary dictionary];
     }
 }
 
@@ -208,76 +296,49 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 
 #pragma mark - Data related to the last message
 
-- (MXEvent *)lastMessageEvent
+- (void)updateLastMessage:(MXRoomLastMessage *)message
 {
-    if (!lastMessageEvent)
-    {
-        // The storage of the event depends if it is a true matrix event or a local echo
-        if (![_lastMessageEventId hasPrefix:kMXEventLocalEventIdPrefix])
-        {
-            lastMessageEvent = [store eventWithEventId:_lastMessageEventId inRoom:_roomId];
-        }
-        else
-        {
-            for (MXEvent *event in [store outgoingMessagesInRoom:_roomId])
-            {
-                if ([event.eventId isEqualToString:_lastMessageEventId])
-                {
-                    lastMessageEvent = event;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Decrypt event if necessary
-    if (lastMessageEvent.eventType == MXEventTypeRoomEncrypted)
-    {
-        if (![_mxSession decryptEvent:lastMessageEvent inTimeline:nil])
-        {
-            NSLog(@"[MXRoomSummary] lastMessageEvent: Warning: Unable to decrypt event. Error: %@", lastMessageEvent.decryptionError);
-        }
-    }
-
-    return lastMessageEvent;
+    _lastMessage = message;
 }
 
-- (void)setLastMessageEvent:(MXEvent *)event
+- (MXHTTPOperation *)resetLastMessage:(void (^)(void))onComplete failure:(void (^)(NSError *))failure commit:(BOOL)commit
 {
-    lastMessageEvent = event;
-    _lastMessageEventId = lastMessageEvent.eventId;
-    _lastMessageOriginServerTs = lastMessageEvent.originServerTs;
-    _isLastMessageEncrypted = event.isEncrypted;
+    return [self resetLastMessageWithMaxServerPaginationCount:0 onComplete:onComplete failure:failure commit:commit];
 }
 
-- (MXHTTPOperation *)resetLastMessage:(void (^)(void))complete failure:(void (^)(NSError *))failure commit:(BOOL)commit
+- (MXHTTPOperation *)resetLastMessageWithMaxServerPaginationCount:(NSUInteger)maxServerPaginationCount onComplete:(void (^)(void))onComplete failure:(void (^)(NSError *))failure commit:(BOOL)commit
 {
-    lastMessageEvent = nil;
-    _lastMessageEventId = nil;
-    _lastMessageOriginServerTs = -1;
-    _lastMessageString = nil;
-    _lastMessageAttributedString = nil;
-    [_lastMessageOthers removeAllObjects];
+    [self updateLastMessage:nil];
 
-    return [self fetchLastMessage:complete failure:failure lastEventIdChecked:nil operation:nil commit:commit];
+    return [self fetchLastMessageWithMaxServerPaginationCount:maxServerPaginationCount onComplete:^{
+        if (onComplete)
+        {
+            onComplete();
+        }
+    } failure:failure timeline:nil operation:nil commit:commit];
 }
 
 /**
- Find the event to be used as last message.
+ Find recursively the event to be used as last message.
 
- @param complete A block object called when the operation completes.
+ @param maxServerPaginationCount The max number of messages to retrieve from the server.
+ @param onComplete A block object called when the operation completes.
  @param failure A block object called when the operation fails.
- @param lastEventIdChecked the id of the last candidate event checked to be the last message.
-        Nil means we will start checking from the last event in the store.
+ @param timeline the timeline to use to paginate and get more events.
  @param operation the current http operation if any.
         The method may need several requests before fetching the right last message.
         If it happens, the first one is mutated to the others with [MXHTTPOperation mutateTo:].
  @param commit tell whether the updated room summary must be committed to the store. Use NO when a more
- global [MXStore commit] will happen. This optimises IO.
+        global [MXStore commit] will happen. This optimises IO.
  @return a MXHTTPOperation
  */
-- (MXHTTPOperation *)fetchLastMessage:(void (^)(void))complete failure:(void (^)(NSError *))failure lastEventIdChecked:(NSString*)lastEventIdChecked operation:(MXHTTPOperation *)operation commit:(BOOL)commit
+- (MXHTTPOperation *)fetchLastMessageWithMaxServerPaginationCount:(NSUInteger)maxServerPaginationCount
+                                                       onComplete:(void (^)(void))onComplete
+                                                          failure:(void (^)(NSError *))failure
+                                                         timeline:(id<MXEventTimeline>)timeline
+                                                        operation:(MXHTTPOperation *)operation commit:(BOOL)commit
 {
+    // Sanity checks
     MXRoom *room = self.room;
     if (!room)
     {
@@ -293,126 +354,102 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         // Create an empty operation that will be mutated later
         operation = [[MXHTTPOperation alloc] init];
     }
-
-    MXWeakify(self);
-    [self.room state:^(MXRoomState *roomState) {
-        MXStrongifyAndReturnIfNil(self);
-
-        // Start by checking events we have in the store
-        MXRoomState *state = roomState;
-        id<MXEventsEnumerator> messagesEnumerator = room.enumeratorForStoredMessages;
-        NSUInteger messagesInStore = messagesEnumerator.remaining;
-        MXEvent *event = messagesEnumerator.nextEvent;
-        NSString *lastEventIdCheckedInBlock = lastEventIdChecked;
-
-        // 1.1 Find where we stopped at the previous call in the fetchLastMessage calls loop
-        BOOL firstIteration = YES;
-        if (lastEventIdCheckedInBlock)
+    
+    // Get the room timeline
+    if (!timeline)
+    {
+        [room liveTimeline:^(id<MXEventTimeline> liveTimeline) {
+            // Use a copy of the live timeline to avoid any conflicts with listeners to the unique live timeline
+            id<MXEventTimeline> timeline = [liveTimeline copyWithZone:nil];
+            [timeline resetPagination];
+            [self fetchLastMessageWithMaxServerPaginationCount:maxServerPaginationCount onComplete:onComplete failure:failure timeline:timeline operation:operation commit:commit];
+        }];
+        return operation;
+    }
+    
+    // Make sure we can still paginate
+    if (![timeline canPaginate:MXTimelineDirectionBackwards])
+    {
+        onComplete();
+        return operation;
+    }
+    
+    // Process every message received by back pagination
+    __block BOOL lastMessageUpdated = NO;
+    MXWeakify(timeline);
+    [timeline listenToEvents:^(MXEvent *event, MXTimelineDirection direction, MXRoomState *eventState) {
+        MXStrongifyAndReturnIfNil(timeline);
+        if (direction == MXTimelineDirectionBackwards
+            && !lastMessageUpdated)
         {
-            firstIteration = NO;
-            while (event)
-            {
-                NSString *eventId = event.eventId;
-
-                event = messagesEnumerator.nextEvent;
-
-                if ([eventId isEqualToString:lastEventIdCheckedInBlock])
-                {
-                    break;
-                }
-            }
+            lastMessageUpdated = [self.mxSession.roomSummaryUpdateDelegate session:self.mxSession updateRoomSummary:self withLastEvent:event eventState:eventState roomState:timeline.state];
         }
-
-        // 1.2 Check events one by one until finding the right last message for the room
-        BOOL lastMessageUpdated = NO;
-        while (event)
-        {
-            // Decrypt the event if necessary
-            if (event.eventType == MXEventTypeRoomEncrypted)
-            {
-                if (![self.mxSession decryptEvent:event inTimeline:nil])
-                {
-                    NSLog(@"[MXRoomSummary] fetchLastMessage: Warning: Unable to decrypt event: %@\nError: %@", event.content[@"body"], event.decryptionError);
-                }
-            }
-
-            if (event.isState)
-            {
-                // Need to go backward in the state to provide it as it was when the event occured
-                if (state.isLive)
-                {
-                    state = [state copy];
-                    state.isLive = NO;
-                }
-
-                [state handleStateEvents:@[event]];
-            }
-
-            lastEventIdCheckedInBlock = event.eventId;
-
-            // Propose the event as last message
-            lastMessageUpdated = [self.mxSession.roomSummaryUpdateDelegate session:self.mxSession updateRoomSummary:self withLastEvent:event eventState:state roomState:roomState];
+    }];
+    
+   
+    if (timeline.remainingMessagesForBackPaginationInStore)
+    {
+        // First, for performance reason, read messages only from the store
+        // Do it one by one to decrypt the minimal number of events.
+        MXHTTPOperation *newOperation = [timeline paginate:1
+                                                 direction:MXTimelineDirectionBackwards
+                                             onlyFromStore:YES
+                                                  complete:^{
             if (lastMessageUpdated)
             {
-                // The event is accepted. We have our last message
-                // The roomSummaryUpdateDelegate has stored the _lastMessageEventId
-                break;
-            }
-
-            event = messagesEnumerator.nextEvent;
-        }
-
-        // 2.1 If lastMessageEventId is still nil, fetch events from the homeserver
-        MXWeakify(self);
-        [room liveTimeline:^(MXEventTimeline *liveTimeline) {
-            MXStrongifyAndReturnIfNil(self);
-
-            if (!self->_lastMessageEventId && [liveTimeline canPaginate:MXTimelineDirectionBackwards])
-            {
-                NSUInteger messagesToPaginate = 30;
-
-                // Reset pagination the first time
-                if (firstIteration)
-                {
-                    [liveTimeline resetPagination];
-
-                    // Make sure we paginate more than the events we have already in the store
-                    messagesToPaginate += messagesInStore;
-                }
-
-                // Paginate events from the homeserver
-                // XXX: Pagination on the timeline may conflict with request from the app
-                __block MXHTTPOperation *newOperation;
-                newOperation = [liveTimeline paginate:messagesToPaginate direction:MXTimelineDirectionBackwards onlyFromStore:NO complete:^{
-
-                    // Received messages have been stored in the store. We can make a new loop
-                    // XXX: This is only true for a permanent storage. Only MXNoStore is not permanent.
-                    // MXNoStore is only used for tests. We can skip it here.
-                    if (self.mxSession.store.isPermanent)
-                    {
-                        [self fetchLastMessage:complete failure:failure
-                            lastEventIdChecked:lastEventIdCheckedInBlock
-                                     operation:(operation ? operation : newOperation)
-                                        commit:commit];
-                    }
-
-                } failure:failure];
-
-                // Update the current HTTP operation
-                [operation mutateTo:newOperation];
+                // We are done
+                [self save:commit];
+                onComplete();
             }
             else
             {
-                if (complete)
-                {
-                    complete();
-                }
-
-                [self save:commit];
+                // Need more messages
+                [self fetchLastMessageWithMaxServerPaginationCount:maxServerPaginationCount onComplete:onComplete failure:failure timeline:timeline operation:operation commit:commit];
             }
-        }];
-    }];
-
+            
+        } failure:failure];
+        
+        [operation mutateTo:newOperation];
+    }
+    else if (maxServerPaginationCount)
+    {
+        // If requested, get messages from the homeserver
+        // Fetch them by batch of 50 messages
+        NSUInteger paginationCount = MIN(maxServerPaginationCount, MXRoomSummaryPaginationChunkSize);
+        MXLogDebug(@"[MXRoomSummary] fetchLastMessage: paginate %@ (%@) messages from the server in %@", @(paginationCount), @(maxServerPaginationCount), _roomId);
+        
+        MXHTTPOperation *newOperation = [timeline paginate:paginationCount
+                                                 direction:MXTimelineDirectionBackwards
+                                             onlyFromStore:NO
+                                                  complete:^{
+            if (lastMessageUpdated)
+            {
+                // We are done
+                [self save:commit];
+                onComplete();
+            }
+            else if (maxServerPaginationCount > MXRoomSummaryPaginationChunkSize)
+            {
+                MXLogDebug(@"[MXRoomSummary] fetchLastMessage: Failed to find last message in %@. Paginate more...", self.roomId);
+                NSUInteger newMaxServerPaginationCount = maxServerPaginationCount - MXRoomSummaryPaginationChunkSize;
+                [self fetchLastMessageWithMaxServerPaginationCount:newMaxServerPaginationCount onComplete:onComplete failure:failure timeline:timeline operation:operation commit:commit];
+            }
+            else
+            {
+                MXLogDebug(@"[MXRoomSummary] fetchLastMessage: Failed to find last message in %@. Stop paginating.", self.roomId);
+                onComplete();
+            }
+            
+        } failure:failure];
+        
+        [operation mutateTo:newOperation];
+    }
+    else
+    {
+        MXLogDebug(@"[MXRoomSummary] fetchLastMessage: Failed to find last message in %@.", self.roomId);
+        onComplete();
+    }
+    
     return operation;
 }
 
@@ -423,7 +460,7 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     // If the last message is a local echo, update it.
     // Do nothing when its sentState becomes sent. In this case, the last message will be
     // updated by the true event coming back from the homeserver.
-    if (event.sentState != MXEventSentStateSent && [event.eventId isEqualToString:_lastMessageEventId])
+    if (event.sentState != MXEventSentStateSent && [event.eventId isEqualToString:_lastMessage.eventId])
     {
         [self handleEvent:event];
     }
@@ -434,7 +471,7 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     MXEvent *event = notif.object;
     NSString *previousId = notif.userInfo[kMXEventIdentifierKey];
 
-    if ([_lastMessageEventId isEqualToString:previousId])
+    if ([_lastMessage.eventId isEqualToString:previousId])
     {
         [self handleEvent:event];
     }
@@ -445,7 +482,7 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     MXRoom *room = notif.object;
     if (_mxSession == room.mxSession && [_roomId isEqualToString:room.roomId])
     {
-        NSLog(@"[MXRoomSummary] roomDidFlushData: %@", _roomId);
+        MXLogDebug(@"[MXRoomSummary] roomDidFlushData: %@", _roomId);
 
         [self resetRoomStateData];
     }
@@ -460,10 +497,18 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         MXStrongifyAndReturnIfNil(self);
 
         // Update the last event if it has been edited
-        if ([replaceEvent.relatesTo.eventId isEqualToString:self.lastMessageEventId])
+        if ([replaceEvent.relatesTo.eventId isEqualToString:self.lastMessage.eventId])
         {
-            MXEvent *editedEvent = [self.lastMessageEvent editedEventFromReplacementEvent:replaceEvent];
-            [self handleEvent:editedEvent];
+            [self.mxSession eventWithEventId:self.lastMessage.eventId
+                                      inRoom:self.roomId
+                                     success:^(MXEvent *event) {
+                MXEvent *editedEvent = [event editedEventFromReplacementEvent:replaceEvent];
+                [self handleEvent:editedEvent];
+            } failure:^(NSError *error) {
+                MXLogErrorDetails(@"[MXRoomSummary] registerEventEditsListener: event fetch failed", @{
+                    @"error": error ?: @"unknown"
+                });
+            }];
         }
     }];
 }
@@ -480,8 +525,41 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 
 #pragma mark - Trust management
 
+- (void)enableTrustTracking:(BOOL)enable
+{
+    if (enable)
+    {
+        if (!_isEncrypted || _trust)
+        {
+            // Not applicable or already enabled
+            return;
+        }
+        
+        MXLogDebug(@"[MXRoomSummary] enableTrustTracking: YES");
+        
+        // Bootstrap trust computation
+        [self registerTrustLevelDidChangeNotifications];
+        [self triggerComputeTrust:YES];
+    }
+    else
+    {
+        MXLogDebug(@"[MXRoomSummary] enableTrustTracking: NO");
+        [self unregisterTrustLevelDidChangeNotifications];
+        _trust = nil;
+    }
+}
+
 - (void)setIsEncrypted:(BOOL)isEncrypted
 {
+    // This should never happen
+    if (_isEncrypted && !isEncrypted)
+    {
+        MXLogErrorDetails(@"[MXRoomSummary] setIsEncrypted: Attempt to reset isEncrypted for room. Ignote it", @{
+            @"room_id": self.roomId ?: @"unknown"
+        });
+        return;
+    }
+    
     _isEncrypted = isEncrypted;
     
     if (_isEncrypted && [MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust)
@@ -493,7 +571,9 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 - (void)setMembersCount:(MXRoomMembersCount *)membersCount
 {
     _membersCount = membersCount;
-    if (_isEncrypted && [MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust)
+    
+    // Update trust if we computed it
+    if (_trust)
     {
         [self triggerComputeTrust:YES];
     }
@@ -501,15 +581,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 
 - (void)bootstrapTrustLevelComputation
 {
-    if (_isEncrypted && [MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust)
+    // Bootstrap trust computation
+    [self registerTrustLevelDidChangeNotifications];
+    
+    if (!self.trust)
     {
-        // Bootstrap trust computation
-        [self registerTrustLevelDidChangeNotifications];
-        
-        if (!self.trust)
-        {
-            [self triggerComputeTrust:YES];
-        }
+        [self triggerComputeTrust:YES];
     }
 }
 
@@ -517,6 +594,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceInfoTrustLevelDidChange:) name:MXDeviceInfoTrustLevelDidChangeNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(crossSigningInfoTrustLevelDidChange:) name:MXCrossSigningInfoTrustLevelDidChangeNotification object:nil];
+}
+
+- (void)unregisterTrustLevelDidChangeNotifications
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:MXDeviceInfoTrustLevelDidChangeNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:MXCrossSigningInfoTrustLevelDidChangeNotification object:nil];
 }
 
 - (void)deviceInfoTrustLevelDidChange:(NSNotification*)notification
@@ -553,17 +636,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         }
         
     } failure:^(NSError *error) {
-        NSLog(@"[MXRoomSummary] trustLevelDidChangeRelatedToUserId fails to retrieve room members");
+        MXLogDebug(@"[MXRoomSummary] trustLevelDidChangeRelatedToUserId fails to retrieve room members");
     }];
 }
 
 - (void)triggerComputeTrust:(BOOL)forceDownload
 {
-    if (!_isEncrypted || ![MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust)
-    {
-        return;
-    }
-    
     // Decide what to do
     if (nextTrustComputation == MXRoomSummaryNextTrustComputationNone)
     {
@@ -578,7 +656,7 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         }
         
         // Skip this request. Wait for the current one to finish
-        NSLog(@"[MXRoomSummary] triggerComputeTrust: Skip it. A request is pending");
+        MXLogDebug(@"[MXRoomSummary] triggerComputeTrust: Skip it. A request is pending");
         return;
     }
     
@@ -611,17 +689,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         [self save:YES];
         
     } failure:^(NSError *error) {
-        NSLog(@"[MXRoomSummary] computeTrust: fails to retrieve room members trusted progress");
+        MXLogDebug(@"[MXRoomSummary] computeTrust: fails to retrieve room members trusted progress");
     }];
 }
 
 
 #pragma mark - Others
-- (NSUInteger)localUnreadEventCount
-{
-    // Check for unread events in store
-    return [store localUnreadEventCount:_roomId withTypeIn:_mxSession.unreadEventTypes];
-}
 
 - (BOOL)isDirect
 {
@@ -630,7 +703,20 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 
 - (void)markAllAsRead
 {
-    [self.room markAllAsRead];
+    [self markAllAsReadUpdatingReadMarker:YES];
+}
+
+- (void)markAllAsReadLocally
+{
+    [self markAllAsReadUpdatingReadMarker:NO];
+}
+
+- (void)markAllAsReadUpdatingReadMarker:(BOOL)updateReadMarker
+{
+    if (updateReadMarker)
+    {
+        [self.room markAllAsRead];
+    }
     
     _notificationCount = 0;
     _highlightCount = 0;
@@ -679,6 +765,38 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     return membershipTransitionState;
 }
 
+- (BOOL)updateLocalUnreadEventCount
+{
+    BOOL updated = NO;
+
+    NSUInteger localUnreadEventCount = [self.mxSession.store localUnreadEventCount:self.roomId
+                                                                          threadId:nil
+                                                                        withTypeIn:self.mxSession.unreadEventTypes];
+    
+    if (self.localUnreadEventCount != localUnreadEventCount)
+    {
+        self.localUnreadEventCount = localUnreadEventCount;
+        updated = YES;
+    }
+    
+    return updated;
+}
+
+- (BOOL)hasAnyUnread
+{
+    return _localUnreadEventCount > 0;
+}
+
+- (BOOL)hasAnyNotification
+{
+    return _notificationCount > 0;
+}
+
+- (BOOL)hasAnyHighlight
+{
+    return _highlightCount > 0;
+}
+
 #pragma mark - Server sync
 - (void)handleStateEvents:(NSArray<MXEvent *> *)stateEvents
 {
@@ -693,7 +811,7 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     }
 }
 
-- (void)handleJoinedRoomSync:(MXRoomSync*)roomSync
+- (void)handleJoinedRoomSync:(MXRoomSync*)roomSync onComplete:(void (^)(void))onComplete
 {
     MXWeakify(self);
     [self.room state:^(MXRoomState *roomState) {
@@ -709,6 +827,10 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         if (roomSync.summary || updated)
         {
             updated |= [self.mxSession.roomSummaryUpdateDelegate session:self.mxSession updateRoomSummary:self withServerRoomSummary:roomSync.summary roomState:roomState];
+        }
+        if (roomSync.accountData)
+        {
+            updated = YES;
         }
 
         // Handle the last message starting by the most recent event.
@@ -735,6 +857,9 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
                 break;
             }
         }
+                
+        // Check for unread events in store and update the localUnreadEventCount value if needed
+        updated |= [self updateLocalUnreadEventCount];
 
         // Store notification counts from unreadNotifications field in /sync response
         if (roomSync.unreadNotifications)
@@ -764,7 +889,8 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         {
             [self save:NO];
         }
-
+        
+        onComplete();
     }];
 }
 
@@ -819,9 +945,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     {
         _roomId = [aDecoder decodeObjectForKey:@"roomId"];
 
+        _roomTypeString = [aDecoder decodeObjectForKey:@"roomTypeString"];
+        _roomType = [aDecoder decodeIntegerForKey:@"roomType"];
         _avatar = [aDecoder decodeObjectForKey:@"avatar"];
         _displayname = [aDecoder decodeObjectForKey:@"displayname"];
         _topic = [aDecoder decodeObjectForKey:@"topic"];
+        _creatorUserId = [aDecoder decodeObjectForKey:@"creatorUserId"];
         _aliases = [aDecoder decodeObjectForKey:@"aliases"];
         _membership = (MXMembership)[aDecoder decodeIntegerForKey:@"membership"];
         _membershipTransitionState = [MXRoomSummary membershipTransitionStateForMembership:_membership];
@@ -831,32 +960,28 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
         _others = [aDecoder decodeObjectForKey:@"others"];
         _isEncrypted = [aDecoder decodeBoolForKey:@"isEncrypted"];
         _trust = [aDecoder decodeObjectForKey:@"trust"];
+        _localUnreadEventCount = (NSUInteger)[aDecoder decodeIntegerForKey:@"localUnreadEventCount"];
         _notificationCount = (NSUInteger)[aDecoder decodeIntegerForKey:@"notificationCount"];
         _highlightCount = (NSUInteger)[aDecoder decodeIntegerForKey:@"highlightCount"];
         _directUserId = [aDecoder decodeObjectForKey:@"directUserId"];
 
-        _lastMessageEventId = [aDecoder decodeObjectForKey:@"lastMessageEventId"];
-        _lastMessageOriginServerTs = [aDecoder decodeInt64ForKey:@"lastMessageOriginServerTs"];
-        _isLastMessageEncrypted = [aDecoder decodeBoolForKey:@"isLastMessageEncrypted"];
-
-        NSDictionary *lastMessageData;
-        if (_isLastMessageEncrypted)
-        {
-            NSData *lastMessageEncryptedData = [aDecoder decodeObjectForKey:@"lastMessageEncryptedData"];
-            NSData *lastMessageDataData = [self decrypt:lastMessageEncryptedData];
-            lastMessageData = [NSKeyedUnarchiver unarchiveObjectWithData:lastMessageDataData];
-        }
-        else
-        {
-            lastMessageData = [aDecoder decodeObjectForKey:@"lastMessageData"];
-        }
-        _lastMessageString = lastMessageData[@"lastMessageString"];
-        _lastMessageAttributedString = lastMessageData[@"lastMessageAttributedString"];
-        _lastMessageOthers = lastMessageData[@"lastMessageOthers"];
+        _lastMessage = [aDecoder decodeObjectForKey:@"lastMessage"];
         
         _hiddenFromUser = [aDecoder decodeBoolForKey:@"hiddenFromUser"];
+        _storedHash = [aDecoder decodeIntegerForKey:@"storedHash"];
+        _dataTypes = (MXRoomSummaryDataTypes)[aDecoder decodeIntegerForKey:@"dataTypes"];
+        _historyVisibility = [aDecoder decodeObjectForKey:@"historyVisibility"];
+        _joinRule = [aDecoder decodeObjectForKey:@"joinRule"];
+        _sentStatus = (MXRoomSummarySentStatus)[aDecoder decodeIntegerForKey:@"sentStatus"];
+        _favoriteTagOrder = [aDecoder decodeObjectForKey:@"favoriteTagOrder"];
+        _parentSpaceIds = [aDecoder decodeObjectForKey:@"parentSpaceIds"];
+        _userIdsSharingLiveBeacon = [aDecoder decodeObjectForKey:@"userIdsSharingLiveBeacon"];
         
-        if (_isEncrypted && [MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust)
+        // Compute the trust if asked to do it automatically
+        // or maintain its computation it has been already calcutated
+        if (_isEncrypted
+            && ([MXSDKOptions sharedInstance].computeE2ERoomSummaryTrust
+                || _trust))
         {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self bootstrapTrustLevelComputation];
@@ -870,9 +995,12 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
 {
     [aCoder encodeObject:_roomId forKey:@"roomId"];
 
+    [aCoder encodeObject:_roomTypeString forKey:@"roomTypeString"];
+    [aCoder encodeInteger:_roomType forKey:@"roomType"];
     [aCoder encodeObject:_avatar forKey:@"avatar"];
     [aCoder encodeObject:_displayname forKey:@"displayname"];
     [aCoder encodeObject:_topic forKey:@"topic"];
+    [aCoder encodeObject:_creatorUserId forKey:@"creatorUserId"];    
     [aCoder encodeObject:_aliases forKey:@"aliases"];
     [aCoder encodeInteger:(NSInteger)_membership forKey:@"membership"];
     [aCoder encodeObject:_membersCount forKey:@"membersCount"];
@@ -884,209 +1012,159 @@ static NSUInteger const kMXRoomSummaryTrustComputationDelayMs = 1000;
     {
         [aCoder encodeObject:_trust forKey:@"trust"];
     }
+    [aCoder encodeInteger:(NSInteger)_localUnreadEventCount forKey:@"localUnreadEventCount"];
     [aCoder encodeInteger:(NSInteger)_notificationCount forKey:@"notificationCount"];
     [aCoder encodeInteger:(NSInteger)_highlightCount forKey:@"highlightCount"];
     [aCoder encodeObject:_directUserId forKey:@"directUserId"];
 
     // Store last message metadata
-    [aCoder encodeObject:_lastMessageEventId forKey:@"lastMessageEventId"];
-    [aCoder encodeInt64:_lastMessageOriginServerTs forKey:@"lastMessageOriginServerTs"];
-    [aCoder encodeBool:_isLastMessageEncrypted forKey:@"isLastMessageEncrypted"];
-
-    // Build last message sensitive data
-    NSMutableDictionary *lastMessageData = [NSMutableDictionary dictionary];
-    if (_lastMessageString)
+    if (_lastMessage)
     {
-        lastMessageData[@"lastMessageString"] = _lastMessageString;
-    }
-    if (_lastMessageAttributedString)
-    {
-        lastMessageData[@"lastMessageAttributedString"] = _lastMessageAttributedString;
-    }
-    if (_lastMessageOthers)
-    {
-        lastMessageData[@"lastMessageOthers"] = _lastMessageOthers;
-    }
-
-    // And encrypt it if necessary
-    if (_isLastMessageEncrypted)
-    {
-        NSData *lastMessageDataData = [NSKeyedArchiver archivedDataWithRootObject:lastMessageData];
-        NSData *lastMessageEncryptedData = [self encrypt:lastMessageDataData];
-
-        if (lastMessageEncryptedData)
-        {
-            [aCoder encodeObject:lastMessageEncryptedData forKey:@"lastMessageEncryptedData"];
-        }
-    }
-    else
-    {
-        [aCoder encodeObject:lastMessageData forKey:@"lastMessageData"];
+        [aCoder encodeObject:_lastMessage forKey:@"lastMessage"];
     }
     
     [aCoder encodeBool:_hiddenFromUser forKey:@"hiddenFromUser"];
+    [aCoder encodeInteger:self.hash forKey:@"storedHash"];
+    [aCoder encodeInteger:_dataTypes forKey:@"dataTypes"];
+    [aCoder encodeObject:_historyVisibility forKey:@"historyVisibility"];
+    [aCoder encodeObject:_joinRule forKey:@"joinRule"];
+    [aCoder encodeInteger:_sentStatus forKey:@"sentStatus"];
+    [aCoder encodeObject:_favoriteTagOrder forKey:@"favoriteTagOrder"];
+    [aCoder encodeObject:_parentSpaceIds forKey:@"parentSpaceIds"];
+    [aCoder encodeObject:_userIdsSharingLiveBeacon forKey:@"userIdsSharingLiveBeacon"];
 }
-
-
-#pragma mark - Last message data encryption
-/**
- The AES-256 key used for encrypting MXRoomSummary sensitive data.
- */
-+ (NSData*)encryptionKey
-{
-    NSData *encryptionKey;
-
-    // Create a dictionary to look up the key in the keychain
-    NSDictionary *searchDict = @{
-                                 (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                                 (__bridge id)kSecAttrService: @"org.matrix.sdk.keychain",
-                                 (__bridge id)kSecAttrAccount: @"MXRoomSummary",
-                                 (__bridge id)kSecReturnData: (__bridge id)kCFBooleanTrue,
-                                 };
-
-    // Make the search
-    CFDataRef foundKey = nil;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)searchDict, (CFTypeRef*)&foundKey);
-
-    if (status == errSecSuccess)
-    {
-        // Use the found key
-        encryptionKey = (__bridge NSData*)(foundKey);
-    }
-    else if (status == errSecItemNotFound)
-    {
-        NSLog(@"[MXRoomSummary] encryptionKey: Generate the key and store it to the keychain");
-
-        // There is not yet a key in the keychain
-        // Generate an AES key
-        NSMutableData *newEncryptionKey = [[NSMutableData alloc] initWithLength:kCCKeySizeAES256];
-        int retval = SecRandomCopyBytes(kSecRandomDefault, kCCKeySizeAES256, newEncryptionKey.mutableBytes);
-        if (retval == 0)
-        {
-            encryptionKey = [NSData dataWithData:newEncryptionKey];
-
-            // Store it to the keychain
-            NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:searchDict];
-            dict[(__bridge id)kSecValueData] = encryptionKey;
-
-            status = SecItemAdd((__bridge CFDictionaryRef)dict, NULL);
-            if (status != errSecSuccess)
-            {
-                // TODO: The iOS 10 simulator returns the -34018 (errSecMissingEntitlement) error.
-                // We need to fix it but there is no issue with the app on real device nor with iOS 9 simulator.
-                NSLog(@"[MXRoomSummary] encryptionKey: SecItemAdd failed. status: %i", (int)status);
-            }
-        }
-        else
-        {
-            NSLog(@"[MXRoomSummary] encryptionKey: Cannot generate key. retval: %i", retval);
-        }
-    }
-    else
-    {
-        NSLog(@"[MXRoomSummary] encryptionKey: Keychain failed. OSStatus: %i", (int)status);
-    }
-    
-    if (foundKey)
-    {
-        CFRelease(foundKey);
-    }
-
-    return encryptionKey;
-}
-
-- (NSData*)encrypt:(NSData*)data
-{
-    NSData *encryptedData;
-
-    CCCryptorRef cryptor;
-    CCCryptorStatus status;
-
-    NSData *key = [MXRoomSummary encryptionKey];
-
-    status = CCCryptorCreateWithMode(kCCDecrypt, kCCModeCTR, kCCAlgorithmAES,
-                                     ccNoPadding, NULL, key.bytes, key.length,
-                                     NULL, 0, 0, kCCModeOptionCTR_BE, &cryptor);
-    if (status == kCCSuccess)
-    {
-        size_t bufferLength = CCCryptorGetOutputLength(cryptor, data.length, false);
-        NSMutableData *buffer = [NSMutableData dataWithLength:bufferLength];
-
-        size_t outLength;
-        status |= CCCryptorUpdate(cryptor,
-                                  data.bytes,
-                                  data.length,
-                                  [buffer mutableBytes],
-                                  [buffer length],
-                                  &outLength);
-
-        status |= CCCryptorRelease(cryptor);
-
-        if (status == kCCSuccess)
-        {
-            encryptedData = buffer;
-        }
-        else
-        {
-            NSLog(@"[MXRoomSummary] encrypt: CCCryptorUpdate failed. status: %i", status);
-        }
-    }
-    else
-    {
-        NSLog(@"[MXRoomSummary] encrypt: CCCryptorCreateWithMode failed. status: %i", status);
-    }
-
-    return encryptedData;
-}
-
-- (NSData*)decrypt:(NSData*)encryptedData
-{
-    NSData *data;
-
-    CCCryptorRef cryptor;
-    CCCryptorStatus status;
-
-    NSData *key = [MXRoomSummary encryptionKey];
-
-    status = CCCryptorCreateWithMode(kCCDecrypt, kCCModeCTR, kCCAlgorithmAES,
-                                     ccNoPadding, NULL, key.bytes, key.length,
-                                     NULL, 0, 0, kCCModeOptionCTR_BE, &cryptor);
-    if (status == kCCSuccess)
-    {
-        size_t bufferLength = CCCryptorGetOutputLength(cryptor, encryptedData.length, false);
-        NSMutableData *buffer = [NSMutableData dataWithLength:bufferLength];
-
-        size_t outLength;
-        status |= CCCryptorUpdate(cryptor,
-                                  encryptedData.bytes,
-                                  encryptedData.length,
-                                  [buffer mutableBytes],
-                                  [buffer length],
-                                  &outLength);
-
-        status |= CCCryptorRelease(cryptor);
-
-        if (status == kCCSuccess)
-        {
-            data = buffer;
-        }
-        else
-        {
-            NSLog(@"[MXRoomSummary] decrypt: CCCryptorUpdate failed. status: %i", status);
-        }
-    }
-    else
-    {
-        NSLog(@"[MXRoomSummary] decrypt: CCCryptorCreateWithMode failed. status: %i", status);
-    }
-    
-    return data;
-}
-
 
 - (NSString *)description
 {
-    return [NSString stringWithFormat:@"%@ %@: %@ - %@", super.description, _roomId, _displayname, _lastMessageString];
+    return [NSString stringWithFormat:@"%@ %@: %@ - %@", super.description, _roomId, _displayname, _lastMessage.eventId];
+}
+
+- (NSUInteger)hash
+{
+    NSUInteger prime = 2;
+    NSUInteger result = 1;
+
+    result = prime * result + [_roomId hash];
+    result = prime * result + [_roomTypeString hash];
+    result = prime * result + [_avatar hash];
+    result = prime * result + [_displayname hash];
+    result = prime * result + [_topic hash];
+    result = prime * result + [_creatorUserId hash];
+    result = prime * result + [_aliases hash];
+    result = prime * result + _membership;
+    result = prime * result + _membershipTransitionState;
+    result = prime * result + _isEncrypted;
+    result = prime * result + [_trust hash];
+    result = prime * result + _localUnreadEventCount;
+    result = prime * result + _notificationCount;
+    result = prime * result + _highlightCount;
+    result = prime * result + @(_hasAnyUnread).unsignedIntegerValue;
+    result = prime * result + @(_hasAnyNotification).unsignedIntegerValue;
+    result = prime * result + @(_hasAnyHighlight).unsignedIntegerValue;
+    result = prime * result + _dataTypes;
+    result = prime * result + _sentStatus;
+    result = prime * result + [_lastMessage.eventId hash];
+    result = prime * result + [_lastMessage.text hash];
+
+    result = [NSNumber numberWithUnsignedInteger:result].hash;
+    while (result > INT64_MAX)
+    {
+        result -= INT64_MAX;
+    }
+    return result;
+}
+
+- (MXRoomSummaryDataTypes)calculateDataTypes
+{
+    MXRoomSummaryDataTypes result = 0;
+    
+    if (self.hiddenFromUser)
+    {
+        result |= MXRoomSummaryDataTypesHidden;
+    }
+    if (self.room.accountData.tags[kMXRoomTagServerNotice])
+    {
+        result |= MXRoomSummaryDataTypesServerNotice;
+    }
+    if (self.room.accountData.tags[kMXRoomTagFavourite])
+    {
+        result |= MXRoomSummaryDataTypesFavorited;
+    }
+    if (self.room.accountData.tags[kMXRoomTagLowPriority])
+    {
+        result |= MXRoomSummaryDataTypesLowPriority;
+    }
+    if (self.membership == MXMembershipInvite)
+    {
+        result |= MXRoomSummaryDataTypesInvited;
+    }
+    if (self.isDirect)
+    {
+        result |= MXRoomSummaryDataTypesDirect;
+    }
+    if (self.roomType == MXRoomTypeSpace)
+    {
+        result |= MXRoomSummaryDataTypesSpace;
+    }
+    if (self.isConferenceUserRoom)
+    {
+        result |= MXRoomSummaryDataTypesConferenceUser;
+    }
+    if (self.hasAnyNotification)
+    {
+        result |= MXRoomSummaryDataTypesUnread;
+    }
+    
+    return result;
+}
+
+- (BOOL)isTyped:(MXRoomSummaryDataTypes)types
+{
+    return (self.dataTypes & types) != 0;
+}
+
+ -(MXRoomSummarySentStatus)calculateSentStatus
+{
+    MXRoomSummarySentStatus status = MXRoomSummarySentStatusOk;
+    NSArray<MXEvent*> *outgoingMsgs = self.room.outgoingMessages;
+
+    for (MXEvent *event in outgoingMsgs)
+    {
+        if (event.sentState == MXEventSentStateFailed)
+        {
+            status = MXRoomSummarySentStatusSentFailed;
+
+            // Check if the error is due to unknown devices
+            if ([event.sentError.domain isEqualToString:MXEncryptingErrorDomain]
+                && event.sentError.code == MXEncryptingErrorUnknownDeviceCode)
+            {
+                status = MXRoomSummarySentStatusSentFailedDueToUnknownDevices;
+                break;
+            }
+        }
+    }
+    
+    return status;
+}
+
+- (BOOL)isEqual:(id)object
+{
+    if (self == object)
+    {
+        return YES;
+    }
+    
+    if (![object isKindOfClass:[MXRoomSummary class]])
+    {
+        return NO;
+    }
+    
+    return [self isEqualToRoomSummary:(MXRoomSummary *)object];
+}
+
+- (BOOL) isEqualToRoomSummary:(MXRoomSummary *)summary
+{
+    return self.hash == summary.hash;
 }
 
 @end

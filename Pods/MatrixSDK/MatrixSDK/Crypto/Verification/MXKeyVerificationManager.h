@@ -86,12 +86,6 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
 #pragma mark - Requests
 
 /**
- The timeout for requests.
- Default is 5 min.
- */
-@property (nonatomic) NSTimeInterval requestTimeout;
-
-/**
  Make a key verification request by to_device events.
  
  @param userId the other user id.
@@ -103,7 +97,7 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
 - (void)requestVerificationByToDeviceWithUserId:(NSString*)userId
                                       deviceIds:(nullable NSArray<NSString*>*)deviceIds
                                         methods:(NSArray<NSString*>*)methods
-                                        success:(void(^)(MXKeyVerificationRequest *request))success
+                                        success:(void(^)(id<MXKeyVerificationRequest> request))success
                                         failure:(void(^)(NSError *error))failure;
 
 /**
@@ -120,13 +114,13 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
                                    roomId:(nullable NSString*)roomId
                              fallbackText:(NSString*)fallbackText
                                   methods:(NSArray<NSString*>*)methods
-                                  success:(void(^)(MXKeyVerificationRequest *request))success
+                                  success:(void(^)(id<MXKeyVerificationRequest> request))success
                                   failure:(void(^)(NSError *error))failure;
 
 /**
  All pending verification requests.
  */
-@property (nonatomic, readonly) NSArray<MXKeyVerificationRequest*> *pendingRequests;
+@property (nonatomic, readonly) NSArray<id<MXKeyVerificationRequest>> *pendingRequests;
 
 
 #pragma mark - Transactions
@@ -143,7 +137,7 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
 - (void)beginKeyVerificationWithUserId:(NSString*)userId
                            andDeviceId:(NSString*)deviceId
                                 method:(NSString*)method
-                               success:(void(^)(MXKeyVerificationTransaction *transaction))success
+                               success:(void(^)(id<MXKeyVerificationTransaction> transaction))success
                                failure:(void(^)(NSError *error))failure __attribute__((deprecated("Start key verification with a request (requestVerificationByToDeviceWithUserId) instead")));
 
 /**
@@ -153,9 +147,9 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
  @param success a block called when the operation succeeds.
  @param failure a block called when the operation fails.
  */
-- (void)beginKeyVerificationFromRequest:(MXKeyVerificationRequest*)request
+- (void)beginKeyVerificationFromRequest:(id<MXKeyVerificationRequest>)request
                                  method:(NSString*)method
-                                success:(void(^)(MXKeyVerificationTransaction *transaction))success
+                                success:(void(^)(id<MXKeyVerificationTransaction> transaction))success
                                 failure:(void(^)(NSError *error))failure;
 
 /**
@@ -163,7 +157,7 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
 
  @param complete a block called with all transactions.
  */
-- (void)transactions:(void(^)(NSArray<MXKeyVerificationTransaction*> *transactions))complete;
+- (void)transactions:(void(^)(NSArray<id<MXKeyVerificationTransaction>> *transactions))complete;
 
 
 #pragma mark - Verification status
@@ -181,14 +175,6 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
                                                               failure:(void(^)(NSError *error))failure;
 
 /**
- Extract the verification identifier from an event.
-
- @param event an event in the verification process.
- @return the key verification id. Nil if the event is not a verification event.
- */
-- (nullable NSString *)keyVerificationIdFromDMEvent:(MXEvent*)event;
-
-/**
  Retrieve pending QR code transaction
 
  @param transactionId The transaction id of the associated verification request event.
@@ -202,6 +188,13 @@ FOUNDATION_EXPORT NSString *const MXKeyVerificationManagerNotificationTransactio
  @param transactionId The transaction id of the associated verification request event.
  */
 - (void)removeQRCodeTransactionWithTransactionId:(NSString*)transactionId;
+
+
+- (void)notifyOthersOfAcceptanceWithTransactionId:(NSString*)transactionId
+                               acceptedUserId:(NSString*)acceptedUserId
+                             acceptedDeviceId:(NSString*)acceptedDeviceId
+                                      success:(void(^)(void))success
+                                      failure:(void(^)(NSError *error))failure;
 
 @end
 

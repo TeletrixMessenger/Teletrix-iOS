@@ -18,6 +18,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 
 #if TARGET_OS_IPHONE
 #import <UIKit/UIKit.h>
@@ -27,6 +28,7 @@
 
 #import "MXEvent.h"
 #import "MXJSONModels.h"
+#import "MXEventContentPollStart.h"
 #import "MXRoomSummary.h"
 #import "MXRoomMember.h"
 #import "MXReceiptData.h"
@@ -37,12 +39,15 @@
 #import "MXCall.h"
 #import "MXEventTimeline.h"
 #import "MXEventsEnumerator.h"
+#import "MXEventContentLocation.h"
 #import "MXCryptoConstants.h"
-#import "MXSendReplyEventStringsLocalizable.h"
+#import "MXSendReplyEventStringLocalizerProtocol.h"
 
 @class MXRoom;
 @class MXSession;
 @class MXUsersTrustLevelSummary;
+
+MX_ASSUME_MISSING_NULLABILITY_BEGIN
 
 #pragma mark - Notifications
 
@@ -61,6 +66,16 @@ FOUNDATION_EXPORT NSString *const kMXRoomInitialSyncNotification;
  The notification object is the concerned room (MXRoom instance).
  */
 FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
+
+/**
+ Error code when tried to join an already joined room.
+ */
+FOUNDATION_EXPORT NSInteger const kMXRoomAlreadyJoinedErrorCode;
+
+/**
+ Error code when attempting to use a room invite sender which is invalid.
+ */
+FOUNDATION_EXPORT NSInteger const kMXRoomInvalidInviteSenderErrorCode;
 
 /**
  `MXRoom` is the class
@@ -85,7 +100,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 /**
  The live events timeline.
  */
-- (void)liveTimeline:(void (^)(MXEventTimeline *liveTimeline))onComplete;
+- (void)liveTimeline:(void (^)(id<MXEventTimeline> liveTimeline))onComplete;
 
 /**
  The current state of the room.
@@ -131,12 +146,36 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 @property (nonatomic, readonly) MXRoomAccountData *accountData;
 
 /**
+ Sets a custom account data content for a given type.
+ 
+ @param content Content of the account data. Required
+ @param type Type of the account data. Required
+ @param success A block object called when the operation succeeds. Optional
+ @param failure A block object called when the operation fails. Optional
+ 
+ @return an MXHTTPOperation instance
+ */
+- (MXHTTPOperation *)setAccountData:(NSDictionary *)content
+                            forType:(NSString *)type
+                            success:(void (^)(void))success
+                            failure:(void (^)(NSError *))failure NS_REFINED_FOR_SWIFT;
+
+/**
+ The text message partially typed by the user but not yet sent.
+ The value is stored by the session store. Thus, it can be retrieved
+ when the application restarts.
+ 
+ @deprecated use partialAttributedTextMessage
+ */
+@property (nonatomic) NSString *partialTextMessage __deprecated_msg("use partialAttributedTextMessage");
+
+/**
  The text message partially typed by the user but not yet sent.
  The value is stored by the session store. Thus, it can be retrieved
  when the application restarts.
  */
 // @TODO(summary): Move to MXRoomSummary
-@property (nonatomic) NSString *partialTextMessage;
+@property (nonatomic) NSAttributedString *partialAttributedTextMessage;
 
 /**
  The list of ids of users currently typing in this room.
@@ -208,16 +247,18 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 /**
  Update room data according to the provided sync response.
  
- @param roomSync information to sync the room with the home server data
+ @param roomSync information to sync the room with the home server data.
+ @param onComplete the block called when the operation completes.
  */
-- (void)handleJoinedRoomSync:(MXRoomSync*)roomSync;
+- (void)handleJoinedRoomSync:(MXRoomSync*)roomSync onComplete:(void (^)(void))onComplete;
 
 /**
  Update the invited room state according to the provided data.
  
  @param invitedRoomSync information to update the room state.
+ @param onComplete the block called when the operation completes.
  */
-- (void)handleInvitedRoomSync:(MXInvitedRoomSync *)invitedRoomSync;
+- (void)handleInvitedRoomSync:(MXInvitedRoomSync *)invitedRoomSync onComplete:(void (^)(void))onComplete;
 
 
 #pragma mark - Stored messages enumerator
@@ -249,6 +290,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 
  @param eventTypeString the type of the event. @see MXEventType.
  @param content the content that will be sent to the server as a JSON object.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object.
                   When the event type is `kMXEventTypeStringRoomMessage`, this pointer
                   is set to an actual MXEvent object containing the local created event which should be used
@@ -266,6 +308,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)sendEventOfType:(MXEventTypeString)eventTypeString
                             content:(NSDictionary<NSString*, id>*)content
+                           threadId:(NSString*)threadId
                           localEcho:(MXEvent**)localEcho
                             success:(void (^)(NSString *eventId))success
                             failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
@@ -292,6 +335,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  Send a room message to a room.
 
  @param content the message content that will be sent to the server as a JSON object.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object. This pointer is set to an actual MXEvent object
                   containing the local created event which should be used to echo the message in
                   the messages list until the resulting event come through the server sync.
@@ -305,6 +349,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @return a MXHTTPOperation instance.
  */
 - (MXHTTPOperation*)sendMessageWithContent:(NSDictionary<NSString*, id>*)content
+                                  threadId:(NSString*)threadId
                                  localEcho:(MXEvent**)localEcho
                                    success:(void (^)(NSString *eventId))success
                                    failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
@@ -314,6 +359,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  
  @param text the text to send.
  @param formattedText the optional HTML formatted string of the text to send.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
                 the event id of the event generated on the home server
@@ -323,6 +369,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)sendTextMessage:(NSString*)text
                       formattedText:(NSString*)formattedText
+                           threadId:(NSString*)threadId
                           localEcho:(MXEvent**)localEcho
                             success:(void (^)(NSString *eventId))success
                             failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
@@ -331,6 +378,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  Send a text message to the room.
 
  @param text the text to send.
+ @param threadId the identifier of thread to send the event.
  @param success A block object called when the operation succeeds. It returns
  the event id of the event generated on the home server
  @param failure A block object called when the operation fails.
@@ -338,6 +386,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @return a MXHTTPOperation instance.
  */
 - (MXHTTPOperation*)sendTextMessage:(NSString*)text
+                           threadId:(NSString*)threadId
                             success:(void (^)(NSString *eventId))success
                             failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
@@ -346,6 +395,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  
  @param emoteBody the emote body to send.
  @param formattedBody the optional HTML formatted string of the emote.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
                 the event id of the event generated on the home server
@@ -355,6 +405,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)sendEmote:(NSString*)emoteBody
                 formattedText:(NSString*)formattedBody
+                     threadId:(NSString*)threadId
                     localEcho:(MXEvent**)localEcho
                       success:(void (^)(NSString *eventId))success
                       failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
@@ -366,6 +417,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @param imageSize the original size of the image.
  @param mimetype  the image mimetype.
  @param thumbnail optional thumbnail image (may be nil).
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
                 the event id of the event generated on the home server
@@ -381,15 +433,47 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 #elif TARGET_OS_OSX
                  andThumbnail:(NSImage*)thumbnail
 #endif
+                     threadId:(NSString*)threadId
+                    localEcho:(MXEvent**)localEcho
+                      success:(void (^)(NSString *eventId))success
+                      failure:(void (^)(NSError *error))failure;
+
+/**
+ Send an image to the room.
+
+ @param imageData the data of the image to send.
+ @param imageSize the original size of the image.
+ @param mimetype  the image mimetype.
+ @param thumbnail optional thumbnail image (may be nil).
+ @param blurhash optional BlurHash (may be nil).
+ @param threadId the identifier of thread to send the event.
+ @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
+ @param success A block object called when the operation succeeds. It returns
+                the event id of the event generated on the home server
+ @param failure A block object called when the operation fails.
+
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)sendImage:(NSData*)imageData
+                withImageSize:(CGSize)imageSize
+                     mimeType:(NSString*)mimetype
+#if TARGET_OS_IPHONE
+                 andThumbnail:(UIImage*)thumbnail
+#elif TARGET_OS_OSX
+                 andThumbnail:(NSImage*)thumbnail
+#endif
+                     blurHash:(NSString*)blurhash
+                     threadId:(NSString*)threadId
                     localEcho:(MXEvent**)localEcho
                       success:(void (^)(NSString *eventId))success
                       failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
 /**
- Send an video to the room.
+ Send a video to the room.
  
  @param videoLocalURL the local filesystem path of the video to send.
  @param videoThumbnail the UIImage hosting a video thumbnail.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
                 the event id of the event generated on the home server
@@ -403,15 +487,41 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 #elif TARGET_OS_OSX
                 withThumbnail:(NSImage*)videoThumbnail
 #endif
+                     threadId:(NSString*)threadId
                     localEcho:(MXEvent**)localEcho
                       success:(void (^)(NSString *eventId))success
                       failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
+
+/**
+ Send a video to the room.
+ 
+ @param videoAsset an AVAsset that represents the video to send.
+ @param videoThumbnail the UIImage hosting a video thumbnail.
+ @param threadId the identifier of thread to send the event.
+ @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
+ @param success A block object called when the operation succeeds. It returns
+                the event id of the event generated on the home server
+ @param failure A block object called when the operation fails.
+ 
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)sendVideoAsset:(AVAsset*)videoAsset
+#if TARGET_OS_IPHONE
+                     withThumbnail:(UIImage*)videoThumbnail
+#elif TARGET_OS_OSX
+                     withThumbnail:(NSImage*)videoThumbnail
+#endif
+                          threadId:(NSString*)threadId
+                         localEcho:(MXEvent**)localEcho
+                           success:(void (^)(NSString *eventId))success
+                           failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
 /**
  Send a file to the room.
  
  @param fileLocalURL the local filesystem path of the file to send.
  @param mimeType the mime type of the file.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
                 the event id of the event generated on the home server
@@ -422,6 +532,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)sendFile:(NSURL*)fileLocalURL
                     mimeType:(NSString*)mimeType
+                    threadId:(NSString*)threadId
                    localEcho:(MXEvent**)localEcho
                      success:(void (^)(NSString *eventId))success
                      failure:(void (^)(NSError *error))failure
@@ -432,6 +543,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)sendFile:(NSURL*)fileLocalURL
                     mimeType:(NSString*)mimeType
+                    threadId:(NSString*)threadId
                    localEcho:(MXEvent**)localEcho
                      success:(void (^)(NSString *eventId))success
                      failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
@@ -441,6 +553,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  
  @param fileLocalURL the local filesystem path of the file to send.
  @param mimeType the mime type of the file.
+ @param threadId the identifier of thread to send the event.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
  the event id of the event generated on the home server
@@ -450,11 +563,38 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @return a MXHTTPOperation instance.
  */
 - (MXHTTPOperation*)sendAudioFile:(NSURL*)fileLocalURL
-                    mimeType:(NSString*)mimeType
-                   localEcho:(MXEvent**)localEcho
-                     success:(void (^)(NSString *eventId))success
-                     failure:(void (^)(NSError *error))failure
-          keepActualFilename:(BOOL)keepActualName NS_REFINED_FOR_SWIFT;
+                         mimeType:(NSString*)mimeType
+                         threadId:(NSString*)threadId
+                        localEcho:(MXEvent**)localEcho
+                          success:(void (^)(NSString *eventId))success
+                          failure:(void (^)(NSError *error))failure
+               keepActualFilename:(BOOL)keepActualName NS_REFINED_FOR_SWIFT;
+
+/**
+ Send a voice message to the room.
+ 
+ @param fileLocalURL the local filesystem path of the file to send.
+ @param mimeType (optional) the mime type of the file. Defaults to `audio/ogg`
+ @param duration the length of the voice message in milliseconds
+ @param samples an array of floating point values normalized to [0, 1], boxed within NSNumbers
+ @param threadId the identifier of thread to send the event.
+ @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
+ @param success A block object called when the operation succeeds. It returns
+ the event id of the event generated on the home server
+ @param failure A block object called when the operation fails.
+ @param keepActualName if YES, the filename in the local storage will be kept while sending.
+ 
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)sendVoiceMessage:(NSURL*)fileLocalURL
+                            mimeType:(NSString*)mimeType
+                            duration:(NSUInteger)duration
+                             samples:(NSArray<NSNumber *> *)samples
+                            threadId:(NSString*)threadId
+                           localEcho:(MXEvent**)localEcho
+                             success:(void (^)(NSString *eventId))success
+                             failure:(void (^)(NSError *error))failure
+                  keepActualFilename:(BOOL)keepActualName NS_REFINED_FOR_SWIFT;
 
 /**
  Cancel a sending operation.
@@ -548,6 +688,21 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @return a MXHTTPOperation instance.
  */
 - (MXHTTPOperation*)setJoinRule:(MXRoomJoinRule)joinRule
+                        success:(void (^)(void))success
+                        failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
+
+/**
+ Set the join rule of the room.
+
+ @param joinRule the join rule to set.
+ @param parentIds list of parent room ID (requested for `restricted` join rule)
+ @param success A block object called when the operation succeeds.
+ @param failure A block object called when the operation fails.
+
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)setJoinRule:(MXRoomJoinRule)joinRule
+                      parentIds:(NSArray<NSString *>*)parentIds
                         success:(void (^)(void))success
                         failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
@@ -653,6 +808,18 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  */
 - (MXHTTPOperation*)leave:(void (^)(void))success
                   failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
+
+/**
+ Ignore the user who sent the invite to this room. This user is then added to the current
+ user's ignore list.
+ 
+ @param success A block object called when the operation is complete.
+ @param failure A block object called when the operation fails.
+
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)ignoreInviteSender:(void (^)(void))success
+                               failure:(void (^)(NSError *error))failure;
 
 /**
  Invite a user to this room.
@@ -818,7 +985,8 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @param eventToReply The event to reply.
  @param textMessage the text to send.
  @param formattedTextMessage the optional HTML formatted string of the text to send.
- @param stringLocalizations string localizations used when building reply message.
+ @param stringLocalizer string localizations used when building reply message.
+ @param threadId identifier of the thread in which the reply event will reside. Pass nil to use room timeline instead.
  @param localEcho a pointer to a MXEvent object (@see sendMessageWithContent: for details).
  @param success A block object called when the operation succeeds. It returns
  the event id of the event generated on the home server
@@ -829,11 +997,50 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 - (MXHTTPOperation*)sendReplyToEvent:(MXEvent*)eventToReply
                      withTextMessage:(NSString*)textMessage
                 formattedTextMessage:(NSString*)formattedTextMessage
-                 stringLocalizations:(id<MXSendReplyEventStringsLocalizable>)stringLocalizations
+                     stringLocalizer:(id<MXSendReplyEventStringLocalizerProtocol>)stringLocalizer
+                            threadId:(NSString*)threadId
                            localEcho:(MXEvent**)localEcho
                              success:(void (^)(NSString *eventId))success
                              failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
+#pragma mark - Polls
+
+- (MXHTTPOperation *)sendPollStartWithContent:(MXEventContentPollStart *)content
+                                     threadId:(NSString*)threadId
+                                    localEcho:(MXEvent **)localEcho
+                                      success:(void (^)(NSString *))success
+                                      failure:(void (^)(NSError *))failure;
+
+- (MXHTTPOperation*)sendPollResponseForEvent:(MXEvent *)pollEvent
+                       withAnswerIdentifiers:(NSArray<NSString *> *)answerIdentifiers
+                                    threadId:(NSString*)threadId
+                                   localEcho:(MXEvent **)localEcho
+                                     success:(void (^)(NSString *eventId))success
+                                     failure:(void (^)(NSError *error))failure;
+
+- (MXHTTPOperation*)sendPollEndForEvent:(MXEvent *)pollEvent
+                               threadId:(NSString*)threadId
+                              localEcho:(MXEvent **)localEcho
+                                success:(void (^)(NSString *eventId))success
+                                failure:(void (^)(NSError *error))failure;
+
+- (MXHTTPOperation *)sendPollUpdateForEvent:(MXEvent *)pollStartEvent
+                                 oldContent:(MXEventContentPollStart *)oldContent
+                                 newContent:(MXEventContentPollStart *)newContent
+                                  localEcho:(MXEvent **)localEcho
+                                    success:(void (^)(NSString *))success
+                                    failure:(void (^)(NSError *))failure;
+
+#pragma mark - Location sharing
+
+- (MXHTTPOperation *)sendLocationWithLatitude:(double)latitude
+                                    longitude:(double)longitude
+                                  description:(NSString *)description
+                                     threadId:(NSString*)threadId
+                                    localEcho:(MXEvent **)localEcho
+                                    assetType:(MXEventAssetType)assetType
+                                      success:(void (^)(NSString *))success
+                                      failure:(void (^)(NSError *))failure;
 
 #pragma mark - Events listeners on the live timeline
 /**
@@ -873,7 +1080,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @param eventId the id of the event.
  @return a new `MXEventTimeline` instance.
  */
-- (MXEventTimeline*)timelineOnEvent:(NSString*)eventId;
+- (id<MXEventTimeline>)timelineOnEvent:(NSString*)eventId;
 
 
 #pragma mark - Fake event objects creation
@@ -883,18 +1090,20 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
  @param eventId the event id. A globally unique string with kMXEventLocalEventIdPrefix prefix is defined when this param is nil.
  @param eventType the type of the event. @see MXEventType.
  @param content the event content.
+ @param threadId the id of the thread to use.
  @return the created event.
  */
-- (MXEvent*)fakeEventWithEventId:(NSString*)eventId eventType:(MXEventTypeString)eventType andContent:(NSDictionary<NSString*, id>*)content;
+- (MXEvent*)fakeEventWithEventId:(NSString*)eventId eventType:(MXEventTypeString)eventType andContent:(NSDictionary<NSString*, id>*)content threadId:(NSString*)threadId;
 
 /**
  Create a temporary message event for the room.
 
  @param eventId the event id. A globally unique string with kMXEventLocalEventIdPrefix prefix is defined when this param is nil.
  @param content the event content.
+ @param threadId the id of the thread to use.
  @return the created event.
  */
-- (MXEvent*)fakeRoomMessageEventWithEventId:(NSString*)eventId andContent:(NSDictionary<NSString*, id>*)content;
+- (MXEvent*)fakeRoomMessageEventWithEventId:(NSString*)eventId andContent:(NSDictionary<NSString*, id>*)content threadId:(NSString*)threadId;
 
 #pragma mark - Outgoing events management
 /**
@@ -983,6 +1192,41 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
                        success:(void (^)(void))success
                        failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
+#pragma mark - Room account data operations
+
+/**
+ Tag an event of the room
+ 
+ @param event the event to tag
+ @param tag the wanted tag
+ @param keywords the potential keywords
+ 
+ @param success A block object called when the operation succeeds.
+ @param failure A block object called when the operation fails.
+
+ @return a MXHTTPOperation instance.
+ */
+- (MXHTTPOperation*)tagEvent:(MXEvent*)event
+                     withTag:(NSString*)tag
+                 andKeywords:(NSArray*)keywords
+                     success:(void (^)(void))success
+                     failure:(void (^)(NSError *error))failure;
+
+/**
+Remove a tag applied on an event of the room
+
+@param event the event to untag
+@param tag the wanted tag
+
+@param success A block object called when the operation succeeds.
+@param failure A block object called when the operation fails.
+
+@return a MXHTTPOperation instance.
+*/
+- (MXHTTPOperation*)untagEvent:(MXEvent*)event
+                       withTag:(NSString*)tag
+                       success:(void (^)(void))success
+                       failure:(void (^)(NSError *error))failure;
 
 #pragma mark - Voice over IP
 
@@ -997,15 +1241,7 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
                    success:(void (^)(MXCall *call))success
                    failure:(void (^)(NSError *error))failure NS_REFINED_FOR_SWIFT;
 
-#pragma mark - Read receipts management
-
-/**
- Handle a receipt event.
- 
- @param event the event to handle.
- @param direction the timeline direction.
- */
-- (BOOL)handleReceiptEvent:(MXEvent *)event direction:(MXTimelineDirection)direction;
+#pragma mark - Read receipts
 
 /**
  If the event was not acknowledged yet, this method acknowlegdes it by sending a receipt event.
@@ -1037,9 +1273,11 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 
  @param eventId The event Id.
  @param sort YES to sort them from the latest to the oldest.
- @return the receipts for an event in a dedicated room.
+ @param completion Completion block containing the receipts for an event in a dedicated room.
  */
-- (NSArray<MXReceiptData*> *)getEventReceipts:(NSString*)eventId sorted:(BOOL)sort;
+- (void)getEventReceipts:(nonnull NSString*)eventId
+                  sorted:(BOOL)sort
+              completion:(nonnull void (^)(NSArray<MXReceiptData*> * _Nonnull))completion;
 
 /**
  Store a receipt.
@@ -1107,3 +1345,5 @@ FOUNDATION_EXPORT NSString *const kMXRoomDidFlushDataNotification;
 - (void)membersTrustLevelSummaryWithForceDownload:(BOOL)forceDownload success:(void (^)(MXUsersTrustLevelSummary *usersTrustLevelSummary))success failure:(void (^)(NSError *error))failure;
 
 @end
+
+MX_ASSUME_MISSING_NULLABILITY_END

@@ -87,13 +87,16 @@ NSString *const MXServiceTermsErrorDomain = @"org.matrix.sdk.MXServiceTermsError
         NSHTTPURLResponse *urlResponse = [MXHTTPOperation urlResponseFromError:error];
         if (urlResponse.statusCode == 404)
         {
-            NSLog(@"[MXServiceTerms] areAllTermsAgreed: No terms (404).");
+            MXLogDebug(@"[MXServiceTerms] areAllTermsAgreed: No terms (404).");
             success([NSProgress new]);
             return;
         }
         
-        NSLog(@"[MXServiceTerms] areAllTermsAgreed: Error");
-        failure(error);
+        MXLogDebug(@"[MXServiceTerms] areAllTermsAgreed: Error");
+        if (failure)
+        {
+            failure(error);
+        }
     }];
 }
 

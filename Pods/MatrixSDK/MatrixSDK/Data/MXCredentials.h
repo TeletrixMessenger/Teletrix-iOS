@@ -1,5 +1,6 @@
 /*
  Copyright 2019 New Vector Ltd
+ Copyright 2021 The Matrix.org Foundation C.I.C
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -17,6 +18,7 @@
 #import <Foundation/Foundation.h>
 
 @class MXLoginResponse;
+@class MXRefreshResponse;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -24,7 +26,7 @@ NS_ASSUME_NONNULL_BEGIN
  The `MXCredentials` class contains credentials to communicate with the Matrix
  Client-Server API.
  */
-@interface MXCredentials : NSObject
+@interface MXCredentials : NSObject <NSCopying>
 
 /**
  The homeserver url (ex: "https://matrix.org").
@@ -45,6 +47,16 @@ NS_ASSUME_NONNULL_BEGIN
  The access token to create a MXRestClient
  */
 @property (nonatomic, nullable) NSString *accessToken;
+
+/**
+ The timestamp in milliseconds for when the access token will expire
+ */
+@property (nonatomic) uint64_t accessTokenExpiresAt;
+
+/**
+ The refresh token, which can be used to obtain new access tokens. (optional)
+*/
+@property (nonatomic, nullable) NSString *refreshToken;
 
 /**
  The access token to create a MXIdentityServerRestClient
@@ -71,6 +83,11 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @property (nonatomic, nullable) NSData *ignoredCertificate;
 
+/**
+ Additonal data received during login process
+ */
+@property (nonatomic, nullable) NSDictionary *loginOthers;
+
 
 /**
  Simple MXCredentials construtor
@@ -93,6 +110,13 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (instancetype)initWithLoginResponse:(MXLoginResponse*)loginResponse
                 andDefaultCredentials:(nullable MXCredentials*)defaultCredentials;
+
+/**
+ Returns suitable credentials for initial sync cache.
+ 
+ @param credentials original credentials of a user
+ */
++ (instancetype)initialSyncCacheCredentialsFrom:(MXCredentials *)credentials;
 
 @end
 

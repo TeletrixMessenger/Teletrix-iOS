@@ -39,6 +39,11 @@ NS_ASSUME_NONNULL_BEGIN
  */
 @property (nonatomic) NSArray<MXKeyBackupVersionTrustSignature*> *signatures;
 
+/**
+ Flag indicating the backup trusted locally.
+ */
+@property (nonatomic, getter=isTrustedLocally) BOOL trustedLocally;
+
 @end
 
 
@@ -62,6 +67,12 @@ NS_ASSUME_NONNULL_BEGIN
  Flag to indicate the signature from this device is valid.
  */
 @property (nonatomic) BOOL valid;
+
+/**
+ The public part of the key master key. Only set if MSK signed.
+ Device and deviceId should always be nil if this is set.
+ */
+@property (nonatomic) NSString *keys;
 
 @end
 

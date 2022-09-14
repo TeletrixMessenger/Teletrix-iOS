@@ -21,6 +21,9 @@
 #import "MXRealmEventScan.h"
 #import "MXRealmMediaScan.h"
 
+#import "MXLog.h"
+#import "RLMRealm+MatrixSDK.h"
+
 @interface MXScanRealmFileProvider()
 
 @property (nonatomic, strong) RLMRealmConfiguration *realmConfiguration;
@@ -52,7 +55,7 @@
     
     if (error)
     {
-        NSLog(@"[MXRealmFileProvider] realmForUser gets error: %@", error);
+        MXLogDebug(@"[MXRealmFileProvider] realmForUser gets error: %@", error);
     }
     
     return realm;
@@ -62,7 +65,7 @@
 {
     RLMRealm *realm = [self realm];
     
-    [realm transactionWithBlock:^{
+    [realm transactionWithName:@"[MXScanRealmFileProvider] deleteAllObjects" block:^{
         [realm deleteAllObjects];
     }];
 }
@@ -86,7 +89,7 @@
     
     if (folderCreationError)
     {
-        NSLog(@"[MXScanRealmFileProvider] Fail to create Realm folder %@ with error: %@", realmFileFolderURL, folderCreationError);
+        MXLogDebug(@"[MXScanRealmFileProvider] Fail to create Realm folder %@ with error: %@", realmFileFolderURL, folderCreationError);
     }
     
     realmConfiguration.fileURL = realmFileURL;

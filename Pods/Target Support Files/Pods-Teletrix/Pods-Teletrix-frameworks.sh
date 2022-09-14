@@ -178,22 +178,26 @@ code_sign_if_enabled() {
 if [[ "$CONFIGURATION" == "Debug" ]]; then
   install_framework "${BUILT_PRODUCTS_DIR}/AFNetworking/AFNetworking.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/GZIP/GZIP.framework"
-  install_framework "${PODS_ROOT}/JitsiMeetSDK/Frameworks/JitsiMeet.framework"
-  install_framework "${PODS_ROOT}/JitsiMeetSDK/Frameworks/WebRTC.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/MatrixSDK/MatrixSDK.framework"
+  install_framework "${BUILT_PRODUCTS_DIR}/MatrixSDKCrypto/MatrixSDKCrypto.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/OLMKit/OLMKit.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/Realm/Realm.framework"
+  install_framework "${BUILT_PRODUCTS_DIR}/SwiftyBeaver/SwiftyBeaver.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/libbase58/libbase58.framework"
+  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/JitsiMeetSDK/JitsiMeetSDK.framework"
+  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/JitsiMeetSDK/WebRTC.framework"
 fi
 if [[ "$CONFIGURATION" == "Release" ]]; then
   install_framework "${BUILT_PRODUCTS_DIR}/AFNetworking/AFNetworking.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/GZIP/GZIP.framework"
-  install_framework "${PODS_ROOT}/JitsiMeetSDK/Frameworks/JitsiMeet.framework"
-  install_framework "${PODS_ROOT}/JitsiMeetSDK/Frameworks/WebRTC.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/MatrixSDK/MatrixSDK.framework"
+  install_framework "${BUILT_PRODUCTS_DIR}/MatrixSDKCrypto/MatrixSDKCrypto.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/OLMKit/OLMKit.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/Realm/Realm.framework"
+  install_framework "${BUILT_PRODUCTS_DIR}/SwiftyBeaver/SwiftyBeaver.framework"
   install_framework "${BUILT_PRODUCTS_DIR}/libbase58/libbase58.framework"
+  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/JitsiMeetSDK/JitsiMeetSDK.framework"
+  install_framework "${PODS_XCFRAMEWORKS_BUILD_DIR}/JitsiMeetSDK/WebRTC.framework"
 fi
 if [ "${COCOAPODS_PARALLEL_CODE_SIGN}" == "true" ]; then
   wait

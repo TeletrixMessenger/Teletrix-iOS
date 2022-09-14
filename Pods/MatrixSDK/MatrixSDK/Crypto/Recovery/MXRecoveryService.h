@@ -37,7 +37,7 @@ typedef NS_ENUM(NSInteger, MXRecoveryServiceErrorCode)
 
 
 /**
- `MXRecoveryService` manages the backup of secrets/keys used by `MXCrypto``.
+ `MXRecoveryService` manages the backup of secrets/keys used by `MXCrypto`.
  
  It stores secrets stored locally (`MXCryptoStore`) on the homeserver SSSS (`MXSecretStorage`)
  and vice versa.
@@ -86,6 +86,14 @@ typedef NS_ENUM(NSInteger, MXRecoveryServiceErrorCode)
                                         success:(void (^)(void))success
                                         failure:(void (^)(NSError *error))failure;
 
+/**
+ Check whether a private key corresponds to the current recovery.
+ 
+ @param privateKey the private key.
+ @param complete called with a boolean that indicates whether or not the key matches
+ */
+- (void)checkPrivateKey:(NSData*)privateKey complete:(void (^)(BOOL match))complete;
+
 
 #pragma mark - Secrets in the recovery
 
@@ -101,6 +109,25 @@ typedef NS_ENUM(NSInteger, MXRecoveryServiceErrorCode)
 
 
 #pragma mark - Backup to recovery
+
+/**
+ Create a recovery and store secrets there.
+ 
+ It will send keys from the local storage to the recovery on the homeserver.
+ Those keys are sent encrypted thanks to SSSS that implements this recovery.
+ 
+ @param secrets secrets ids to store in the recovery. Nil for all self.supportedSecrets.
+ @param privateKey a private key used to generate the recovery key to encrypt keys.
+ @param createServicesBackups YES to create backups for associated services. Only keyBackup is supported.
+ 
+ @param success A block object called when the operation succeeds.
+ @param failure A block object called when the operation fails.
+ */
+- (void)createRecoveryForSecrets:(nullable NSArray<NSString*>*)secrets
+                  withPrivateKey:(NSData*)privateKey
+           createServicesBackups:(BOOL)createServicesBackups
+                         success:(void (^)(MXSecretStorageKeyCreationInfo *keyCreationInfo))success
+                         failure:(void (^)(NSError *error))failure;
 
 /**
  Create a recovery and store secrets there.

@@ -36,8 +36,10 @@
 #import "MXKeyVerificationManager.h"
 #import "MXCrossSigning.h"
 #import "MXUsersTrustLevelSummary.h"
+#import "MXExportedOlmDevice.h"
 
 @class MXSession;
+@class MXRoom;
 
 /**
  Fires when we receive a room key request.
@@ -137,6 +139,17 @@ extern NSString *const MXDeviceListDidUpdateUsersDevicesNotification;
 + (void)checkCryptoWithMatrixSession:(MXSession*)mxSession complete:(void (^)(MXCrypto *crypto))complete;
 
 /**
+ Stores the exportedOlmDevice related to the credentials into the store.
+
+ @param exportedOlmDevice OlmDevice data to be stored
+ @param credentials credentials related to the exportedOlmDevice
+ @param complete a block called in any case when the operation completes.
+ */
++ (void)rehydrateExportedOlmDevice:(MXExportedOlmDevice*)exportedOlmDevice
+                   withCredentials:(MXCredentials *)credentials
+                          complete:(void (^)(BOOL success))complete;
+
+/**
  Start the crypto module.
  
  Device keys will be uploaded, then one time keys if there are not enough on the homeserver.
@@ -173,25 +186,35 @@ extern NSString *const MXDeviceListDidUpdateUsersDevicesNotification;
  
  @param event the event to decrypt.
 
- @return YES if keys are present.
+ @param onComplete the block called when the operations completes. It returns the result
  */
-- (BOOL)hasKeysToDecryptEvent:(MXEvent*)event;
+- (void)hasKeysToDecryptEvent:(MXEvent*)event
+                   onComplete:(void (^)(BOOL))onComplete;
 
 /**
  Decrypt a received event.
- 
- In case of success, the event is updated with clear data.
- In case of failure, event.decryptionError contains the error.
 
+ @warning This method is deprecated, use -[MXCrypto decryptEvents:inTimeline:onComplete:] instead.
+ 
  @param event the raw event.
  @param timeline the id of the timeline where the event is decrypted. It is used
                  to prevent replay attack.
  
- @param error the result error if there is a problem decrypting the event.
-
- @return The decryption result. Nil if it failed.
+ @return The decryption result.
  */
-- (MXEventDecryptionResult *)decryptEvent:(MXEvent*)event inTimeline:(NSString*)timeline error:(NSError** )error;
+- (MXEventDecryptionResult *)decryptEvent:(MXEvent*)event inTimeline:(NSString*)timeline __attribute__((deprecated("use -[MXCrypto decryptEvents:inTimeline:onComplete:] instead")));
+
+/**
+ Decrypt events asynchronously.
+ 
+ @param events the events to decrypt.
+ @param timeline the id of the timeline where the events are decrypted. It is used
+        to prevent replay attack.
+ @param onComplete the block called when the operations completes. It returns the decryption result for every event.
+ */
+- (void)decryptEvents:(NSArray<MXEvent*> *)events
+           inTimeline:(NSString*)timeline
+           onComplete:(void (^)(NSArray<MXEventDecryptionResult *>*))onComplete;
 
 /**
  Ensure that the outbound session is ready to encrypt events.
@@ -212,6 +235,14 @@ extern NSString *const MXDeviceListDidUpdateUsersDevicesNotification;
                                    failure:(void (^)(NSError *error))failure;
 
 /**
+ Discard the current outbound group session for a specific room.
+ 
+ @param roomId Identifer of the room.
+ @param onComplete the callback called once operation is done.
+ */
+- (void)discardOutboundGroupSessionForRoomWithRoomId:(NSString*)roomId onComplete:(void (^)(void))onComplete;
+
+/**
  Handle list of changed users provided in the /sync response.
 
  @param deviceLists the list of users who have a change in their devices.
@@ -224,6 +255,26 @@ extern NSString *const MXDeviceListDidUpdateUsersDevicesNotification;
  @param deviceOneTimeKeysCount the number of one-time keys the server has for our device.
  */
 - (void)handleDeviceOneTimeKeysCount:(NSDictionary<NSString *, NSNumber*>*)deviceOneTimeKeysCount;
+
+/**
+ Handle the unused fallback keys returned in the /sync response.
+
+ @param deviceUnusedFallbackKeys the algorithms for which there are unused fallback keys
+ */
+- (void)handleDeviceUnusedFallbackKeys:(NSArray<NSString *> *)deviceUnusedFallbackKeys;
+
+/**
+ Handle a room key event.
+ 
+ @param event the room key event.
+ @param onComplete the block called when the operation completes.
+ */
+- (void)handleRoomKeyEvent:(MXEvent*)event onComplete:(void (^)(void))onComplete;
+
+/**
+ Handle the sync response that may contain crypto-related events
+ */
+- (void)handleSyncResponse:(MXSyncResponse *)syncResponse;
 
 /**
  Handle the completion of a /sync.
@@ -554,7 +605,23 @@ extern NSString *const MXDeviceListDidUpdateUsersDevicesNotification;
  */
 - (BOOL)isBlacklistUnverifiedDevicesInRoom:(NSString *)roomId;
 
+
 /**
+ Tells if a room is encrypted according to the crypo module.
+ It is different than the summary or state store. The crypto store
+ is more restrictive and can never be reverted to an unsuported algorithm
+ So prefer this when deciding if an event should be sent encrypted as a protection
+ against state broken/reset issues.
+ */
+- (BOOL)isRoomEncrypted:(NSString *)roomId;
+
+/**
+ Get the current shared history status of the room, which depends on its `m.room.history_visibility`
+ (history is considered shared if visibility is set to `shared` or `world_readable`)
+ */
+- (BOOL)isRoomSharingHistory:(NSString *)roomId;
+
+/**he
  Set the blacklist of unverified devices in a room.
  
  @param roomId the room id.
